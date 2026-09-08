@@ -4,7 +4,7 @@ An advanced Windows Forms application for synchronizing game saves. This version
 
 <img width="532" height="732" alt="image" src="https://github.com/user-attachments/assets/e91360f4-771d-436d-8199-239ce236139f" />
 
-<img width="607" height="454" alt="image" src="https://github.com/user-attachments/assets/5b6438ee-195a-414e-8e79-52816e134dc4" />
+<img width="653" height="490" alt="image" src="https://github.com/user-attachments/assets/19c49792-8a1e-4007-9196-a717058de053" />
 
 
 ## 🌟 Key Features
