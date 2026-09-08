@@ -1,0 +1,1 @@
+Currently these are Launcher Scripts for these two services. the paths are hardcoded currently as my hostname is always 'amd' on my systems, so you will need to change it if you want to do more with them. they should work fine on fedora based distros.
