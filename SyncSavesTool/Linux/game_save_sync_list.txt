@@ -1,0 +1,42 @@
+# Format: Local_Path_To_Save , NAS_Subfolder_Name
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/Documents/WB Games/, WB_Games
+/home/amd/BAK_Saves/, Batman Arkham Knight
+/home/amd/Documents/emulators/Cemu/mlc01/usr/save/00050000/10143500/, WWHD
+/home/amd/Documents/emulators/Cemu/mlc01/usr/save/00050000/1019e500/, TPHD
+/home/amd/Documents/emulators/Cemu/mlc01/usr/save/00050000/1f600a00/, Paper Mario Color Splash
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/Documents/CPY_SAVES/, CPY_SAVES
+/home/amd/Hitman 3/Peacock/userdata/, Hitman_3_Peacock_userdata
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/Documents/My Games/, My_Games
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Roaming/Goldberg SteamEmu Saves/, Goldberg_SteamEmu_Saves
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Roaming/Goldberg UplayEmu Saves/, Goldberg_UplayEmu_Saves
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Roaming/Cuphead/, Cuphead
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Local/DELTARUNE/, DELTARUNE
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Local/Ori and the Will of The Wisps/, Ori_and_the_Will_of_The_Wisps
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Local/QuantumBreak/, QuantumBreak
+/home/amd/.local/share/Celeste/Saves/, Celeste_Saves
+/home/amd/.local/share/eden/nand/user/save/0000000000000000/6D4F96CA25455ABFACD1EC4D5322769A/, Eden_Switch_Saves
+/home/amd/.cache/AppImage-Cache/eden/, eden shader cache
+/home/amd/.local/share/Cemu/mlc01/usr/save/, Cemu_Saves
+/home/amd/.local/share/azaharplus-emu/sdmc, Azahar saves
+/home/amd/.local/share/azaharplus-emu, Azahar Files
+/home/amd/.config/azaharplus-emu, Azahar Config
+/home/amd/.local/share/TwilitRealm/Dusklight/, Dusklight
+/home/amd/.local/share/sm64coopdx/, sm64coopdx
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/ww/Saved/SaveGames/, WereWolf Apocalypse
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/GOG.com/Galaxy/Applications/, GoG Games
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/DevilsHuntUnreal/Saved/SaveGames/, DevilsHuntUnreal
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/HellbladeGame/Saved/, HellbladeGame
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/Injustice2/, Injustice 2
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Roaming/FLT/, Injustice 2 SteamEmu
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/ScarsAbove/Saved/, ScarsAbove
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/G1R/Saved/, Gothic Remake
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/My Games/Trials of Mana/GOG/, Trials of Mana
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/Documents/My Games/Control/, Control
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/Remedy/, Alan Wake Saves
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/Local/Remedy/, Alan Wake 2
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/Baldur's Gate II - Enhanced Edition/, Baldur's Gate 2
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/SteelrisingGOG/, Steel Rising
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/LocalLow/Team Cherry/, Hollow Knight & SilkSong
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/LocalLow/Clover Bite/GRIME/, GRIME
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/LocalLow/Midgar Studio/, Edge of Eternity
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Roaming/Cuphead/, CyberPunk
