@@ -1,0 +1,10 @@
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/ | C:\Users\RetpmusGameStation
+/home/amd/Documents/emulators/ | D:\Emulation
+/home/amd/Games/Heroic/Prefixes/Shared/drive_c/users/steamuser/AppData/ | C:\Users\RetpmusGameStation\AppData
+/home/amd/.config/azaharplus-emu | C:\Users\RetpmusGameStation\AppData\Roaming\AzaharPlus
+/home/amd/.local/share/azaharplus-emu/sdmc | C:\Users\RetpmusGameStation\AppData\Roaming\AzaharPlus\sdmc
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/AppData/Local/DevilsHuntUnreal/Saved/SaveGames/ | C:\Users\RetpmusGameStation\AppData\Local\DevilsHuntUnreal\Saved\SaveGames\
+/home/amd/Documents/emulators/Cemu/ | D:\Emulation\Cemu
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/My Games/ | C:\Users\RetpmusGameStation\Documents\My Games
+/home/amd/Games/Heroic/Prefixes/Shared/pfx/dosdevices/c:/users/steamuser/Documents/Remedy/ | C:\Users\RetpmusGameStation\Documents\Remedy
+/home/amd/.local/share/ | C:\Users\RetpmusGameStation\AppData\Roaming
