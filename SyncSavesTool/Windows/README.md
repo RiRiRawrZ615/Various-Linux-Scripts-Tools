@@ -34,3 +34,4 @@ This directory contains:
 * `game_path_mappings.txt`: The path translation database.
 * `game_save_sync_list.txt`: Your game save list.
 * `icon.ico`: The application icon.
+* `Start Save Tool.lnk` this is a modifiable shortcut for the tool, it isnt universal but it's easy to edit.
