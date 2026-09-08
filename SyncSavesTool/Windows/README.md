@@ -2,6 +2,11 @@
 
 An advanced Windows Forms application for synchronizing game saves. This version is specifically designed for cross-platform use, allowing you to manage the same game lists on both Linux and Windows.
 
+<img width="532" height="732" alt="image" src="https://github.com/user-attachments/assets/e91360f4-771d-436d-8199-239ce236139f" />
+
+<img width="607" height="454" alt="image" src="https://github.com/user-attachments/assets/5b6438ee-195a-414e-8e79-52816e134dc4" />
+
+
 ## 🌟 Key Features
 
 * **Cross-Platform Path Translation:** Uses an intelligent translation engine to map Linux/Wine paths to Windows directories. This allows you to use the exact same `game_save_sync_list.txt` on both Linux and Windows without manual editing.
