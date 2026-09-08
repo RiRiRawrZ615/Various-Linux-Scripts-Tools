@@ -2,6 +2,10 @@
 
 A powerful synchronization tool for managing game saves between local directories and a backup location (such as a NAS).
 
+<img width="607" height="409" alt="image_2026-09-06_19-41-43" src="https://github.com/user-attachments/assets/887f127e-9b96-4680-8406-73354a002b71" />
+
+<img width="604" height="501" alt="image_2026-09-06_19-41-43 (3)" src="https://github.com/user-attachments/assets/d41abaf1-3958-4c66-82d9-2cfe6e92c833" />
+
 ## 🛠️ Features
 
 * **Dual Interface:** Run in the terminal using the TUI, or launch the Zenity GUI using the `-g` or `--gui` flag.
