@@ -43,7 +43,8 @@ echo "[STATUS] Initializing llama-server on port 8081 with GPU Embeddings..."
   --host 0.0.0.0 \
   --port 8081 \
   -ngl 99 \
-  --ctx-size 8192 \
+  --ctx-size 32768 \
+  --cache-ram 16384 \
   -fa on \
   --batch-size 2048 \
   --ubatch-size 2048 \
