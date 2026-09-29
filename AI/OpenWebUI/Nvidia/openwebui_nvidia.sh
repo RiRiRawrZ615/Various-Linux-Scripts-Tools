@@ -219,7 +219,7 @@ def register_model(alias: str, model_path: Path, source: str, mmproj: Path | Non
 def load_raw_ggufs(root: Path) -> None:
     for path in sorted(root.rglob("*.gguf")):
         name = path.name.lower()
-        if "mmproj" in name or "projector" in name or "mtp" in name or "assistant" in name or "draft" in name: 
+        if "mmproj" in name or "projector" in name or "mtp" in name or "assistant" in name or "draft" in name:
             continue
         if looks_like_gguf(path):
             register_model(f"local/{path.stem}:gguf", path, "raw-gguf", None)
@@ -367,14 +367,13 @@ def build_llama_command(model_info: dict) -> list[str]:
         "-ctv", str(profile.get("cache_type_v", "q4_0")),
         "-t", str(profile.get("threads", 6)),
         "-tb", str(profile.get("threads_batch", 8)),
-        "--swa-full", "--ctx-checkpoints", "1", "--reasoning", "off",
-        "--reasoning-budget", "1024",
+        "--swa-full", "--ctx-checkpoints", "1", "--reasoning", "on",
+        "--reasoning-budget", "4096",
     ]
 
     if profile.get("apply_chat_template", True):
         cmd += ["--chat-template", SAFE_JINJA_TEMPLATE]
 
-    # FIX: Explicitly pass 'on' to satisfy the strict argument parser.
     if profile.get("flash_attn", True):
         cmd += ["-fa", "on"]
     else:
@@ -389,15 +388,13 @@ def build_llama_command(model_info: dict) -> list[str]:
         for _file in _dir.iterdir():
             if _file == _model_path:
                 continue
-            
+
             _f_lower = _file.name.lower()
-            
-            # Detect Multi-Modal Projector
+
             if not found_mmproj and ("mmproj" in _f_lower or "projector" in _f_lower) and _f_lower.endswith(".gguf"):
                 cmd += ["--mmproj", str(_file)]
                 found_mmproj = True
-            
-            # Detect MTP / Draft Assistant Models
+
             elif not found_draft and ("mtp" in _f_lower or "assistant" in _f_lower or "draft" in _f_lower) and _f_lower.endswith(".gguf"):
                 cmd += ["-md", str(_file), "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.8"]
                 if "mtp" in _f_lower:
@@ -439,13 +436,9 @@ def chat_completions():
     if "max_tokens" not in data and "max_completion_tokens" not in data: data["max_tokens"] = DEFAULT_MAX_TOKENS
     model_id = data.get("model")
 
-    if "messages" in data and len(data["messages"]) > 1:
-        pass
-
     if not model_id or model_id not in MODEL_MAP:
         return jsonify({"error": f"Unknown model: {model_id}"}), 400
 
-    # Fetch profile tracking fields explicitly to stop command array variation from killing Tool pipelines
     target_profile = load_or_create_profile(model_id)
     active_ngl = target_profile.get("ngl", 28)
     active_ctx = target_profile.get("ctx_size", 256000)
@@ -495,8 +488,6 @@ def chat_completions():
     def generate():
         for chunk in resp.iter_content(chunk_size=None):
             if chunk:
-                chunk = chunk.replace(b"<|channel|>thought", b"")
-                chunk = chunk.replace(b"<channel|>", b"")
                 yield chunk
     return Response(generate(), resp.status_code, headers)
 
@@ -528,6 +519,7 @@ echo "[STATUS] Engine is ready. Profiles mapped to: $PROFILES_DIR"
 # -----------------------------
 export DATA_DIR="$WEBUI_DATA_DIR"
 export ENABLE_PERSISTENT_CONFIG=True
+export ENABLE_KB_EXEC=True
 export ENABLE_OLLAMA_API=False
 export ENABLE_OPENAI_API=True
 export OPENAI_API_BASE_URL="http://127.0.0.1:5000/v1"
