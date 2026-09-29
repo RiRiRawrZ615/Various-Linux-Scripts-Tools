@@ -17,14 +17,14 @@ cd "$TARGET_DIR"
 # Optimized for RTX 4070 (12GB) with Q6 + GPU Vector Embeddings
 "$LLAMA_BIN" -m "$MODEL_PATH" --host 0.0.0.0 --port 8081 \
   -ngl 99 \
-  --ctx-size 6144 \
-  --cache-ram 0 \
+  --ctx-size 16834 \
+  --cache-ram 16834 \
   --cache-type-k q4_0 \
   --cache-type-v q4_0 \
   -fa on \
   -np 1 \
-  --batch-size 1280 \
-  --ubatch-size 1280 \
+  --batch-size 1024 \
+  --ubatch-size 1024 \
   --embedding \
   --pooling mean \
   --threads 4 &
