@@ -31,7 +31,7 @@ WEBUI_LOG="${WEBUI_LOG:-$HOME/Documents/openwebui.log}"
 BRAVE_PROFILE="${BRAVE_PROFILE:-$HOME/.config/Brave-AI-App}"
 
 # RESTORED V4 PATHS TO RECOVER USER PROFILE AND DATA
-WEBUI_DATA_DIR="${WEBUI_DATA_DIR:-$HOME/.open-webui-llamacpp-safe-v4}"
+WEBUI_DATA_DIR="/home/amd/.open-webui-llamacpp-safe-v4"
 RUNTIME_DIR="${RUNTIME_DIR:-$HOME/.cache/openwebui-llamacpp-safe-v4}"
 
 # -----------------------------
@@ -41,17 +41,17 @@ LLAMA_PROFILE="${LLAMA_PROFILE:-faster}"
 
 case "$LLAMA_PROFILE" in
     saver)
-        DEFAULT_CTX_SIZE=65536
+        DEFAULT_CTX_SIZE=256000
         DEFAULT_BATCH=1024
         DEFAULT_UBATCH=1024
         ;;
     balanced)
-        DEFAULT_CTX_SIZE=65536
+        DEFAULT_CTX_SIZE=256000
         DEFAULT_BATCH=2048
         DEFAULT_UBATCH=1024
         ;;
     faster)
-        DEFAULT_CTX_SIZE=65536
+        DEFAULT_CTX_SIZE=256000
         DEFAULT_BATCH=2048
         DEFAULT_UBATCH=2048
         ;;
@@ -151,7 +151,6 @@ import subprocess
 import time
 import re
 import hashlib
-import threading
 from pathlib import Path
 
 import requests
@@ -159,7 +158,6 @@ from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 current_process = None
-model_lock = threading.Lock()
 
 # Verification parameters for hot-reload state validation
 active_ngl = None
@@ -221,7 +219,8 @@ def register_model(alias: str, model_path: Path, source: str, mmproj: Path | Non
 def load_raw_ggufs(root: Path) -> None:
     for path in sorted(root.rglob("*.gguf")):
         name = path.name.lower()
-        if "mmproj" in name or "projector" in name: continue
+        if "mmproj" in name or "projector" in name or "mtp" in name or "assistant" in name or "draft" in name:
+            continue
         if looks_like_gguf(path):
             register_model(f"local/{path.stem}:gguf", path, "raw-gguf", None)
 
@@ -232,8 +231,6 @@ def load_models() -> None:
     load_raw_ggufs(root)
 
 # ==============================================================================
-# MODULAR PROFILE SYSTEM
-# ==============================================================================
 
 def generate_default_profile(model_id: str) -> dict:
     """Generates an optimal configuration based on model heuristics."""
@@ -243,10 +240,9 @@ def generate_default_profile(model_id: str) -> dict:
     size_match = re.search(r"(\d+)\s*b", lid)
     param_size = int(size_match.group(1)) if size_match else 12
 
-    # Global baselines seeded from the bash script environment
     profile = {
         "ngl": int(os.environ.get("LLAMA_NGL", 28)),
-        "ctx_size": int(os.environ.get("DEFAULT_CTX_SIZE", 65536)),
+        "ctx_size": int(os.environ.get("DEFAULT_CTX_SIZE", 256000)),
         "batch": int(os.environ.get("DEFAULT_BATCH", 2048)),
         "ubatch": int(os.environ.get("DEFAULT_UBATCH", 2048)),
         "threads": int(os.environ.get("LLAMA_THREADS", 6)),
@@ -263,29 +259,21 @@ def generate_default_profile(model_id: str) -> dict:
         "extra_args": []
     }
 
-    # -- PER-MODEL TEMPLATES --
-
-    # 1. Rocinante / Small Dense Optimization
     if not is_moe and param_size <= 16:
         profile["ngl"] = 99
         profile["ncmoe"] = 0
         profile["cmoe"] = False
 
-    # 2. Gemma Optimization
     if "gemma" in lid:
         profile["apply_chat_template"] = False
         if "gemma-3-27b" in lid or ("gemma-3" in lid and param_size >= 27):
-            # Prevent 16GB VRAM overflow on creation by moving rule to profile generation
             profile["ngl"] = 32
         else:
             profile["ngl"] = 99
-
-    # 3. Standard MoE
     elif is_moe and "deepseek" not in lid:
         profile["cmoe"] = os.environ.get("LLAMA_CPU_MOE_ALL", "1") == "1"
         profile["ncmoe"] = int(os.environ.get("LLAMA_N_CPU_MOE", 16))
 
-    # 4. DeepSeek Specific Optimization
     if "deepseek" in lid:
         profile["cache_type_k"] = "f16"
         profile["cache_type_v"] = "f16"
@@ -317,7 +305,6 @@ def load_or_create_profile(model_id: str) -> dict:
 
     return profile
 
-# ==============================================================================
 
 def stop_current_model() -> None:
     global current_process
@@ -326,7 +313,7 @@ def stop_current_model() -> None:
     except: pass
     try: os.killpg(os.getpgid(current_process.pid), signal.SIGTERM)
     except: pass
-    try: 
+    try:
         current_process.wait(timeout=10)
     except:
         try: os.kill(-current_process.pid, signal.SIGKILL)
@@ -372,7 +359,7 @@ def build_llama_command(model_info: dict) -> list[str]:
         "--port", str(LLAMA_PORT),
         "--alias", model_info["id"],
         "-ngl", str(profile.get("ngl", 28)),
-        "--ctx-size", str(profile.get("ctx_size", 65536)),
+        "--ctx-size", str(profile.get("ctx_size", 256000)),
         "--parallel", str(profile.get("parallel", 1)),
         "-b", str(profile.get("batch", 2048)),
         "-ub", str(profile.get("ubatch", 2048)),
@@ -380,27 +367,40 @@ def build_llama_command(model_info: dict) -> list[str]:
         "-ctv", str(profile.get("cache_type_v", "q4_0")),
         "-t", str(profile.get("threads", 6)),
         "-tb", str(profile.get("threads_batch", 8)),
-        "--swa-full", "--ctx-checkpoints", "1", "--reasoning", "off",
-        "--reasoning-budget", "1024",
+        "--swa-full", "--ctx-checkpoints", "1", "--reasoning", "on",
+        "--reasoning-budget", "4096",
     ]
 
     if profile.get("apply_chat_template", True):
         cmd += ["--chat-template", SAFE_JINJA_TEMPLATE]
 
-    # FIX: Explicitly pass 'on' to satisfy the strict argument parser.
     if profile.get("flash_attn", True):
         cmd += ["-fa", "on"]
     else:
         cmd += ["-fa", "off"]
 
+    # ================= MTP and MMPROJ AUTO-DETECTION =================
     _model_path = Path(model_info["model"])
     _dir = _model_path.parent
     if _dir.is_dir():
+        found_mmproj = False
+        found_draft = False
         for _file in _dir.iterdir():
+            if _file == _model_path:
+                continue
+
             _f_lower = _file.name.lower()
-            if ("mmproj" in _f_lower or "projector" in _f_lower) and _f_lower.endswith(".gguf"):
+
+            if not found_mmproj and ("mmproj" in _f_lower or "projector" in _f_lower) and _f_lower.endswith(".gguf"):
                 cmd += ["--mmproj", str(_file)]
-                break
+                found_mmproj = True
+
+            elif not found_draft and ("mtp" in _f_lower or "assistant" in _f_lower or "draft" in _f_lower) and _f_lower.endswith(".gguf"):
+                cmd += ["-md", str(_file), "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.8"]
+                if "mtp" in _f_lower:
+                    cmd += ["--spec-type", "draft-mtp"]
+                found_draft = True
+    # =================================================================
 
     if profile.get("cmoe", False):
         cmd.append("-cmoe")
@@ -424,10 +424,7 @@ def wait_for_ready(process: subprocess.Popen) -> tuple[bool, str]:
         if process.poll() is not None: return False, "llama-server exited during startup."
         for url in urls:
             try:
-                if process.poll() is not None: return False, "llama-server died during probe."
-                if requests.get(url, timeout=1).status_code == 200: 
-                    if process.poll() is not None: return False, "llama-server vanished post-response."
-                    return True, "ready"
+                if requests.get(url, timeout=2).status_code == 200: return True, "ready"
             except: pass
         time.sleep(1)
     return False, "Timeout waiting for llama-server."
@@ -444,41 +441,39 @@ def chat_completions():
 
     target_profile = load_or_create_profile(model_id)
     active_ngl = target_profile.get("ngl", 28)
-    active_ctx = target_profile.get("ctx_size", 65536)
+    active_ctx = target_profile.get("ctx_size", 256000)
 
-    with model_lock:
-        cached_model = getattr(current_process, "model_id", None)
-        cached_ngl = getattr(current_process, "active_ngl", None)
-        cached_ctx = getattr(current_process, "active_ctx", None)
-        
-        log(f"[ENGINE] Incoming request for model: '{model_id}' | Currently active: '{cached_model}'")
+    cached_model = getattr(current_process, "model_id", None)
+    cached_ngl = getattr(current_process, "active_ngl", None)
+    cached_ctx = getattr(current_process, "active_ctx", None)
+    log(f"[ENGINE] Incoming request for model: '{model_id}' | Currently active: '{cached_model}'")
 
-        if (not current_process or
-            cached_model != model_id or
-            current_process.poll() is not None or
-            cached_ngl != active_ngl or
-            cached_ctx != active_ctx):
+    if (not current_process or
+        cached_model != model_id or
+        current_process.poll() is not None or
+        cached_ngl != active_ngl or
+        cached_ctx != active_ctx):
 
-            log(f"[HOT-RELOAD] State validation shift caught (Model: {cached_model}->{model_id}, NGL: {cached_ngl}->{active_ngl}, CTX: {cached_ctx}->{active_ctx}). Resetting server...")
-            stop_current_model()
-            cmd = build_llama_command(MODEL_MAP[model_id])
+        log(f"[HOT-RELOAD] State validation shift caught (Model: {cached_model}->{model_id}, NGL: {cached_ngl}->{active_ngl}, CTX: {cached_ctx}->{active_ctx}). Resetting server...")
+        stop_current_model()
+        cmd = build_llama_command(MODEL_MAP[model_id])
 
-            with open(LLAMA_LOG, "a", encoding="utf-8") as logf:
-                logf.write(f"\n--- [HOT-RELOAD] {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-                logf.write("[ENGINE] Using profile parameters to start llama-server:\n")
-                logf.write(" ".join(cmd) + "\n\n")
-                logf.flush()
-                current_process = subprocess.Popen(cmd, stdout=logf, stderr=logf, preexec_fn=os.setsid)
+        with open(LLAMA_LOG, "a", encoding="utf-8") as logf:
+            logf.write(f"\n--- [HOT-RELOAD] {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            logf.write("[ENGINE] Using profile parameters to start llama-server:\n")
+            logf.write(" ".join(cmd) + "\n\n")
+            logf.flush()
+            current_process = subprocess.Popen(cmd, stdout=logf, stderr=logf, preexec_fn=os.setsid)
 
-            current_process.model_id = model_id
-            current_process.active_ngl = active_ngl
-            current_process.active_ctx = active_ctx
-            if LLAMA_PID_FILE:
-                try: Path(LLAMA_PID_FILE).write_text(str(current_process.pid), encoding="utf-8")
-                except: pass
+        current_process.model_id = model_id
+        current_process.active_ngl = active_ngl
+        current_process.active_ctx = active_ctx
+        if LLAMA_PID_FILE:
+            try: Path(LLAMA_PID_FILE).write_text(str(current_process.pid), encoding="utf-8")
+            except: pass
 
-        ok, message = wait_for_ready(current_process)
-        if not ok: return jsonify({"error": message}), 500
+    ok, message = wait_for_ready(current_process)
+    if not ok: return jsonify({"error": message}), 500
 
     try:
         resp = requests.post(f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions", json=data, stream=True, timeout=2400)
@@ -493,8 +488,6 @@ def chat_completions():
     def generate():
         for chunk in resp.iter_content(chunk_size=None):
             if chunk:
-                chunk = chunk.replace(b"<|channel|>thought", b"")
-                chunk = chunk.replace(b"<channel|>", b"")
                 yield chunk
     return Response(generate(), resp.status_code, headers)
 
@@ -525,11 +518,12 @@ echo "[STATUS] Engine is ready. Profiles mapped to: $PROFILES_DIR"
 # Start Open WebUI
 # -----------------------------
 export DATA_DIR="$WEBUI_DATA_DIR"
-export ENABLE_PERSISTENT_CONFIG=False
+export ENABLE_PERSISTENT_CONFIG=True
+export ENABLE_KB_EXEC=True
 export ENABLE_OLLAMA_API=False
 export ENABLE_OPENAI_API=True
-export OPENAI_API_BASE_URL="http://127.0.0.1:$API_PORT/v1"
-export OPENAI_API_KEY="none"
+export OPENAI_API_BASE_URL="http://127.0.0.1:5000/v1"
+export OPENAI_API_KEY="MUxyyX0YO4i1LJ5NNQz13zga9GW941nSy971YX96hoU"
 export WEBUI_AUTH
 export WEBUI_SECRET_KEY
 
