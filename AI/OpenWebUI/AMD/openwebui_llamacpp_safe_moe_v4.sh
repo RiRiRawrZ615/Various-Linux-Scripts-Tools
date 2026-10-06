@@ -409,7 +409,11 @@ def build_llama_command(model_info: dict) -> list[str]:
     else:
         cmd += ["-ncmoe", "0"]
 
-    if profile.get("no_mmap", False): cmd.append("--no-mmap")
+    load_mode = profile.get("load_mode")
+    if load_mode:
+        cmd += ["--load-mode", str(load_mode)]
+    elif profile.get("no_mmap", False):
+        cmd += ["--load-mode", "none"]
     if profile.get("no_warmup", False): cmd.append("--no-warmup")
 
     extra_args = profile.get("extra_args", [])
