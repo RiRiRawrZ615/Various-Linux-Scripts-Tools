@@ -409,8 +409,16 @@ def build_llama_command(model_info: dict) -> list[str]:
     else:
         cmd += ["-ncmoe", "0"]
 
-    if profile.get("no_mmap", False): cmd.append("--no-mmap")
-    if profile.get("no_warmup", False): cmd.append("--no-warmup")
+    # Current llama.cpp uses --load-mode none instead of --no-mmap.
+    # Keep backward compatibility with older JSON profiles.
+    load_mode = profile.get("load_mode")
+    if load_mode:
+        cmd += ["--load-mode", str(load_mode)]
+    elif profile.get("no_mmap", False):
+        cmd += ["--load-mode", "none"]
+
+    if profile.get("no_warmup", False):
+        cmd.append("--no-warmup")
 
     extra_args = profile.get("extra_args", [])
     if isinstance(extra_args, list) and len(extra_args) > 0:
