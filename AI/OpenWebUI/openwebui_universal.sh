@@ -513,6 +513,16 @@ VISION_MIN_FREE_VRAM_GB = float(os.environ.get("VISION_MIN_FREE_VRAM_GB", "2"))
 VISION_ALIAS = "vision-helper"
 vision_process = None
 VISION_ANALYSIS_CACHE: dict[str, str] = {}
+OPEN_TERMINAL_ENABLED = os.environ.get("OPEN_TERMINAL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+OPEN_TERMINAL_HOST = os.environ.get("OPEN_TERMINAL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+OPEN_TERMINAL_PORT = int(os.environ.get("OPEN_TERMINAL_PORT", "8003"))
+OPEN_TERMINAL_CWD = os.path.abspath(os.path.expanduser(
+    os.environ.get("OPEN_TERMINAL_CWD", os.environ.get("OPEN_TERMINAL_OUTPUT_DIR", "~/Documents/AI_Output"))
+))
+OPEN_TERMINAL_KEY_FILE = os.path.expanduser(os.environ.get("OPEN_TERMINAL_KEY_FILE", "~/.config/open-terminal/api-key"))
+_LLAMA_HELP_CACHE: str | None = None
+_OPEN_TERMINAL_SCHEMA_CACHE: tuple[float, list[dict], dict[str, dict]] | None = None
+_VISION_FORCE_CPU_OVERRIDE: bool = False
 
 MODEL_MAP = {}
 
@@ -575,59 +585,176 @@ TOOL_ROUTING_BASE = (
     "Never fabricate tool calls or write placeholder text such as [display_file: ...]. Only report actions confirmed by actual tool results.\n"
 )
 
-def request_tool_names(data: dict) -> list[str]:
-    """Extract function names from OpenAI-compatible tool definitions."""
-    found: list[str] = []
+def request_tool_specs(data: dict) -> list[dict]:
+    """Extract tool names and descriptions from OpenAI-compatible tool schemas."""
+    found: list[dict] = []
     tools = data.get("tools", [])
     if isinstance(tools, list):
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
             spec = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-            name = spec.get("name") if isinstance(spec, dict) else None
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
             if isinstance(name, str) and name.strip():
-                found.append(name.strip())
+                found.append({
+                    "name": name.strip(),
+                    "description": str(spec.get("description") or ""),
+                    "parameters": spec.get("parameters") if isinstance(spec.get("parameters"), dict) else {},
+                })
     functions = data.get("functions", [])
     if isinstance(functions, list):
         for function in functions:
             if isinstance(function, dict) and isinstance(function.get("name"), str):
-                found.append(function["name"].strip())
-    return sorted(set(name for name in found if name))
+                found.append({
+                    "name": function["name"].strip(),
+                    "description": str(function.get("description") or ""),
+                    "parameters": function.get("parameters") if isinstance(function.get("parameters"), dict) else {},
+                })
+    unique: dict[str, dict] = {}
+    for item in found:
+        if item["name"]:
+            # Prefer a richer schema when modern tools and legacy functions overlap.
+            old = unique.get(item["name"])
+            if old is None or len(item["description"]) > len(old["description"]):
+                unique[item["name"]] = item
+    return [unique[name] for name in sorted(unique)]
 
-def has_terminal_file_tools(names: list[str]) -> bool:
-    joined = " ".join(names).lower()
-    indicators = (
-        "display_file", "write_file", "replace_file_content", "run_command",
-        "run_process", "open_terminal", "terminal_files", "terminal__",
-    )
-    return any(indicator in joined for indicator in indicators)
+def request_tool_names(data: dict) -> list[str]:
+    """Compatibility wrapper for call sites that only need tool names."""
+    return [item["name"] for item in request_tool_specs(data)]
+
+def classify_tool_capabilities(specs: list[dict]) -> dict[str, bool]:
+    """
+    Detect actual capabilities, not merely a vague substring in tool names.
+    Exclude known non-host execution tools such as kb_exec and execute_code.
+    """
+    shell_names = {
+        "run_command", "run_process", "execute_command", "shell", "terminal",
+        "terminal_exec", "terminal_run", "open_terminal", "run_shell_command",
+        "exec_command", "command",
+    }
+    write_names = {
+        "write_file", "create_file", "edit_file", "replace_file_content",
+        "append_file", "mkdir", "move_file", "copy_file", "delete_file",
+        "create_directory", "terminal_write_file", "terminal_files_write",
+    }
+    display_names = {"display_file", "show_file", "present_file", "download_file"}
+    shell = False
+    host_files = False
+    display = False
+    for spec in specs:
+        name = spec["name"].strip().lower()
+        description = spec["description"].lower()
+        compact = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+        # Never infer host access from generic code interpreters, knowledge-base
+        # commands, or browser sandboxes, even if their descriptions mention code.
+        if any(token in compact for token in ("kb_exec", "execute_code", "code_interpreter", "pyodide", "python_sandbox")):
+            continue
+        is_host_terminal = (
+            compact in shell_names
+            or any(compact.endswith("_" + candidate) for candidate in shell_names)
+            or any(token in compact for token in ("terminal_run", "terminal_exec", "run_shell", "exec_command"))
+            or ("host terminal" in description and any(word in description for word in ("command", "shell", "execute")))
+            or ("runs shell commands" in description and "host" in description)
+        )
+        is_host_file = (
+            compact in write_names
+            or any(compact.endswith("_" + candidate) for candidate in write_names)
+            or any(token in compact for token in ("terminal_files", "write_file", "create_file", "replace_file_content"))
+            or ("host filesystem" in description and any(word in description for word in ("write", "create", "edit")))
+        )
+        is_display = compact in display_names or "display_file" in compact
+        shell = shell or is_host_terminal
+        host_files = host_files or is_host_file
+        display = display or is_display
+        extra_shell_names = {
+            "get_process_status", "send_process_input", "kill_process", "list_processes",
+            "read_shell", "send_shell_input", "execute", "get_info",
+        }
+        extra_file_names = {
+            "read_file", "list_files", "grep_search", "glob_search", "match_files",
+        }
+        if (
+            compact in extra_shell_names
+            or any(compact.endswith("_" + candidate) for candidate in extra_shell_names)
+            or any(token in compact for token in (
+                "run_command", "get_process_status", "send_process_input", "kill_process", "list_processes",
+            ))
+            or any(phrase in description for phrase in (
+                "run a shell command", "shell command in the background",
+                "poll a background process", "running process's stdin",
+                "terminate a background process", "tracked background processes",
+            ))
+        ):
+            shell = True
+        if (
+            compact in extra_file_names
+            or any(compact.endswith("_" + candidate) for candidate in extra_file_names)
+            or any(token in compact for token in (
+                "read_file", "list_files", "grep_search", "glob_search", "match_files",
+            ))
+            or any(phrase in description for phrase in (
+                "write text content to a file", "find and replace strings in a file",
+                "list files and directories", "read a file's contents",
+                "search for text patterns across files", "search for files by name using glob",
+            ))
+        ):
+            host_files = True
+    return {"shell": shell, "host_files": host_files, "display_file": display}
 
 def inject_tool_routing_instructions(data: dict, tool_names: list[str]) -> bool:
-    """Teach the model what its tools do without hiding or disabling any tool."""
+    """Teach the model how to route tasks while preserving every exposed tool."""
     messages = data.get("messages")
     if not isinstance(messages, list) or not tool_names:
         return False
 
-    terminal_available = has_terminal_file_tools(tool_names)
-    normalized_names = {name.lower() for name in tool_names}
+    specs = request_tool_specs(data)
+    capabilities = classify_tool_capabilities(specs)
+    terminal_available = capabilities["shell"] or capabilities["host_files"]
     prompt = TOOL_ROUTING_BASE
     prompt += "Tools exposed in this exact request: " + ", ".join(tool_names[:80]) + (" ..." if len(tool_names) > 80 else "") + ".\n"
+    prompt += (
+        "Capability check for this exact request: "
+        f"host_shell={capabilities['shell']}, host_file_write={capabilities['host_files']}, "
+        f"display_file={capabilities['display_file']}. "
+        "Treat these as separate capabilities; never infer one from another.\n"
+    )
     if terminal_available:
         prompt += (
-            "Open Terminal tools ARE present in this request. Prefer the actual terminal's command, file, and display tools for host operations. "
-            "Do not call kb_exec or execute_code for work that should happen on the host.\n\n"
+            "Host-side tools are present in this request. Use only the exposed tool whose description/schema matches the action. "
+            "For shell commands, use a host-shell tool; for file edits, use a host-file tool. "
+            "Do not assume an unavailable capability exists, and do not call kb_exec or execute_code for host operations. "
+            "All other specialized tools remain available and should still be used for their intended jobs.\n\n"
         )
-        prompt += ARTIFACT_TOOL_PROMPT
+        artifact_prompt = ARTIFACT_TOOL_PROMPT
+        if not capabilities["display_file"]:
+            artifact_prompt = artifact_prompt.replace(
+                "After validation succeeds, call the actual Open Terminal display_file tool with the absolute host path and inline=true "
+                "so Open WebUI can render a real file card with preview and download controls. Do not write fake [display_file: ...] text. ",
+                "After validation succeeds, use a real file-display/download tool only if one is exposed in this request. "
+                "If none is exposed, state that a native file card cannot be attached in this turn; do not write fake [display_file: ...] text. "
+            )
+        if not capabilities["shell"]:
+            artifact_prompt = artifact_prompt.replace(
+                "Before delivery, verify the file exists and is non-empty. Run the host-side validator with "
+                + f'python3 "{ARTIFACT_VALIDATOR}" "/absolute/path/to/file". ',
+                "Before delivery, verify the file exists and is non-empty. Run host-side validation only if a host command tool is exposed; "
+                "otherwise verify the file using available host-file tools and clearly state that executable validation could not be run. "
+            )
+        prompt += artifact_prompt
     else:
         prompt += (
-            "Open Terminal tools are NOT present in this request, even if the server is configured elsewhere. "
-            "Do not pretend to have host access. Do not use kb_exec or execute_code as substitutes for terminal commands or host files. "
-            "For a host-terminal task, tell the user to select/enable Local Open Terminal in the chat terminal picker, then retry."
+            "No reliable host shell or host-file-write capability is exposed in this request. "
+            "Do not pretend to have host access. Do not use kb_exec, execute_code, or browser tools as substitutes for terminal commands "
+            "or host files. For a host-terminal task, explain that Local Open Terminal must be selected/enabled in the chat terminal picker, "
+            "or that the integration must expose its host tools to this request. Other specialized tools remain available for their own purposes."
         )
 
     marker = TOOL_ROUTING_PROMPT_PREFIX
-    # Refresh an already-injected routing block to match the tools exposed on
-    # THIS request. A chat may start without Open Terminal selected and add it later.
+    # Replace our prior routing block each request so the instructions match the
+    # currently selected toolset rather than a stale earlier toolset.
     for message in messages:
         if (
             isinstance(message, dict) and message.get("role") == "system"
@@ -636,10 +763,11 @@ def inject_tool_routing_instructions(data: dict, tool_names: list[str]) -> bool:
             existing = message["content"]
             prefix = existing.split(marker, 1)[0].rstrip()
             message["content"] = (prefix + "\n\n" if prefix else "") + prompt
-            if terminal_available:
-                log("[TOOLS] Refreshed routing instructions: Open Terminal is available; other tools remain available")
-            else:
-                log("[TOOLS] Refreshed routing instructions: Open Terminal is not exposed in this request")
+            log(
+                "[TOOLS] Refreshed routing: "
+                f"host_shell={capabilities['shell']}, host_file_write={capabilities['host_files']}, "
+                f"display_file={capabilities['display_file']}; all tools preserved"
+            )
             return True
 
     first_system = next(
@@ -656,12 +784,589 @@ def inject_tool_routing_instructions(data: dict, tool_names: list[str]) -> bool:
         else:
             messages.insert(first_system + 1, {"role": "system", "content": prompt})
 
+    log(
+        "[TOOLS] Routing instructions added: "
+        f"host_shell={capabilities['shell']}, host_file_write={capabilities['host_files']}, "
+        f"display_file={capabilities['display_file']}; no tools disabled"
+    )
     if terminal_available:
-        log("[TOOLS] Routing instructions added: Open Terminal is available; knowledge-base and browser tools remain available for their own uses")
-        log("[ARTIFACT] Added real-file creation, validation, and display_file delivery instructions")
+        log("[ARTIFACT] Added host-file creation and validation guidance based on actual exposed capabilities")
     else:
-        log("[TOOLS] Routing instructions added: Open Terminal was not included in this request; no other tool will be treated as a terminal")
+        log("[TOOLS] No host shell/file-write tool detected; non-terminal tools were not treated as terminal substitutes")
     return True
+
+
+def is_background_aux_request(data: dict) -> bool:
+    """Detect Open WebUI internal title/tag/follow-up/query generation requests."""
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("task"):
+        return True
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return True
+    last_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") in {"user", "system"}:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                last_text = content
+            elif isinstance(content, list):
+                last_text = " ".join(
+                    str(p.get("text", "")) for p in content if isinstance(p, dict)
+                )
+            if last_text:
+                break
+    lowered = last_text.lower()
+    aux_markers = (
+        "### task:",
+        "generate a concise, 3-5 word title",
+        "generate 1-3 broad tags",
+        "suggest 3-5 relevant follow-up",
+        "generate search queries",
+        "autocompletion system",
+    )
+    return any(marker in lowered for marker in aux_markers)
+
+
+def read_open_terminal_api_key() -> str:
+    try:
+        key_path = Path(OPEN_TERMINAL_KEY_FILE).expanduser()
+        if key_path.is_file():
+            return key_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return os.environ.get("OPEN_TERMINAL_API_KEY", "").strip()
+
+
+def open_terminal_is_healthy() -> bool:
+    if not OPEN_TERMINAL_ENABLED:
+        return False
+    try:
+        r = requests.get(f"http://{OPEN_TERMINAL_HOST}:{OPEN_TERMINAL_PORT}/health", timeout=1.5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _builtin_open_terminal_tools() -> tuple[list[dict], dict[str, dict]]:
+    """Fallback OpenAI tool schemas and HTTP dispatch rules for Open Terminal."""
+    specs = [
+        {
+            "name": "run_command",
+            "description": f"Run a shell command in the host terminal (default working directory: {OPEN_TERMINAL_CWD}).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute on the host."},
+                    "cwd": {"type": "string", "description": "Optional working directory path."},
+                },
+                "required": ["command"],
+            },
+            "method": "POST",
+            "path": "/execute",
+        },
+        {
+            "name": "get_process_status",
+            "description": "Poll a background command process for new output and exit status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string", "description": "Process ID returned by run_command."},
+                    "id": {"type": "string", "description": "Alias for process_id."},
+                    "tail": {"type": "integer", "description": "Optional number of recent output entries."},
+                },
+            },
+            "method": "GET",
+            "path": "/execute/{process_id}/status",
+        },
+        {
+            "name": "send_process_input",
+            "description": "Send text input to a running background process's stdin.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string", "description": "Process ID returned by run_command."},
+                    "input": {"type": "string", "description": "Text to write to stdin."},
+                },
+                "required": ["process_id", "input"],
+            },
+            "method": "POST",
+            "path": "/execute/{process_id}/input",
+        },
+        {
+            "name": "kill_process",
+            "description": "Terminate a running background process.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string", "description": "Process ID returned by run_command."},
+                },
+                "required": ["process_id"],
+            },
+            "method": "DELETE",
+            "path": "/execute/{process_id}",
+        },
+        {
+            "name": "list_processes",
+            "description": "List tracked background processes in the terminal session.",
+            "parameters": {"type": "object", "properties": {}},
+            "method": "GET",
+            "path": "/execute",
+        },
+        {
+            "name": "list_files",
+            "description": "List files and directories at a given host path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to list (defaults to workspace root)."},
+                },
+            },
+            "method": "GET",
+            "path": "/files/list",
+        },
+        {
+            "name": "read_file",
+            "description": "Read a file's contents from the host filesystem.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to read."},
+                    "start_line": {"type": "integer", "description": "Optional 1-based start line."},
+                    "end_line": {"type": "integer", "description": "Optional 1-based end line."},
+                },
+                "required": ["path"],
+            },
+            "method": "GET",
+            "path": "/files/read",
+        },
+        {
+            "name": "write_file",
+            "description": "Write text content to a file on the host filesystem (creates parent directories automatically).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to write."},
+                    "content": {"type": "string", "description": "Complete text content to write."},
+                },
+                "required": ["path", "content"],
+            },
+            "method": "POST",
+            "path": "/files/write",
+        },
+        {
+            "name": "replace_file_content",
+            "description": "Find and replace strings in a file on the host filesystem.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to modify."},
+                    "target": {"type": "string", "description": "Exact string to find."},
+                    "replacement": {"type": "string", "description": "Replacement string."},
+                },
+                "required": ["path", "target", "replacement"],
+            },
+            "method": "POST",
+            "path": "/files/replace",
+        },
+        {
+            "name": "display_file",
+            "description": "Open or attach a host file in the user's Open WebUI file viewer/card.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file on the host."},
+                    "inline": {"type": "boolean", "description": "Display inline card in chat (default true)."},
+                },
+                "required": ["path"],
+            },
+            "method": "POST",
+            "path": "/files/display",
+        },
+        {
+            "name": "grep_search",
+            "description": "Search for text or regex patterns across files in a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Pattern to search for."},
+                    "path": {"type": "string", "description": "Directory or file path to search in."},
+                },
+                "required": ["pattern"],
+            },
+            "method": "GET",
+            "path": "/files/grep",
+        },
+        {
+            "name": "glob_search",
+            "description": "Search for files by name using glob patterns (e.g. '*.py').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern to match filenames."},
+                    "path": {"type": "string", "description": "Base directory to search."},
+                },
+                "required": ["pattern"],
+            },
+            "method": "GET",
+            "path": "/files/glob",
+        },
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": item["name"],
+                "description": item["description"],
+                "parameters": item["parameters"],
+            },
+        }
+        for item in specs
+    ]
+    dispatch = {
+        item["name"]: {"method": item["method"], "path": item["path"], "parameters": item["parameters"]}
+        for item in specs
+    }
+    return tools, dispatch
+
+
+def fetch_open_terminal_tools() -> tuple[list[dict], dict[str, dict]]:
+    """Fetch live OpenAPI tool schemas from Open Terminal, merging with built-in fallback."""
+    global _OPEN_TERMINAL_SCHEMA_CACHE
+    now = time.monotonic()
+    if _OPEN_TERMINAL_SCHEMA_CACHE is not None and (now - _OPEN_TERMINAL_SCHEMA_CACHE[0]) < 60.0:
+        return copy.deepcopy(_OPEN_TERMINAL_SCHEMA_CACHE[1]), copy.deepcopy(_OPEN_TERMINAL_SCHEMA_CACHE[2])
+
+    fallback_tools, fallback_dispatch = _builtin_open_terminal_tools()
+    if not open_terminal_is_healthy():
+        return fallback_tools, fallback_dispatch
+
+    headers = {}
+    api_key = read_open_terminal_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        resp = requests.get(
+            f"http://{OPEN_TERMINAL_HOST}:{OPEN_TERMINAL_PORT}/openapi.json",
+            headers=headers,
+            timeout=3,
+        )
+        if resp.status_code != 200:
+            return fallback_tools, fallback_dispatch
+        spec = resp.json()
+    except Exception:
+        return fallback_tools, fallback_dispatch
+
+    components = spec.get("components", {}).get("schemas", {}) if isinstance(spec, dict) else {}
+
+    def resolve_schema(node, depth: int = 0) -> dict:
+        if not isinstance(node, dict) or depth > 8:
+            return {"type": "object", "properties": {}}
+        if "$ref" in node and isinstance(node["$ref"], str):
+            ref_name = node["$ref"].rsplit("/", 1)[-1]
+            target = components.get(ref_name, {})
+            return resolve_schema(target, depth + 1)
+        out = {}
+        for k, v in node.items():
+            if k == "properties" and isinstance(v, dict):
+                out[k] = {pk: resolve_schema(pv, depth + 1) for pk, pv in v.items()}
+            elif k == "items" and isinstance(v, dict):
+                out[k] = resolve_schema(v, depth + 1)
+            elif k in {"anyOf", "oneOf", "allOf"} and isinstance(v, list):
+                non_null = [item for item in v if isinstance(item, dict) and item.get("type") != "null"]
+                if non_null:
+                    resolved = resolve_schema(non_null[0], depth + 1)
+                    out.update(resolved)
+            else:
+                out[k] = copy.deepcopy(v)
+        return out
+
+    tools_by_name = {t["function"]["name"]: t for t in fallback_tools}
+    dispatch_map = copy.deepcopy(fallback_dispatch)
+
+    paths = spec.get("paths", {}) if isinstance(spec, dict) else {}
+    for route_path, methods in paths.items():
+        if not isinstance(methods, dict):
+            continue
+        for method_name, op in methods.items():
+            if method_name.lower() not in {"get", "post", "put", "delete", "patch"} or not isinstance(op, dict):
+                continue
+            op_id = str(op.get("operationId") or "").strip()
+            if not op_id:
+                continue
+            if route_path in {"/health", "/ports", "/api/config", "/system"} and op_id not in dispatch_map:
+                continue
+            props = {}
+            required = []
+            query_params = []
+            path_params = []
+            for param in op.get("parameters", []):
+                if not isinstance(param, dict):
+                    continue
+                pname = param.get("name")
+                pin = param.get("in")
+                if not isinstance(pname, str) or pin == "header":
+                    continue
+                pschema = resolve_schema(param.get("schema", {"type": "string"}))
+                if param.get("description") and "description" not in pschema:
+                    pschema["description"] = str(param["description"])
+                props[pname] = pschema
+                if param.get("required"):
+                    required.append(pname)
+                if pin == "query":
+                    query_params.append(pname)
+                elif pin == "path":
+                    path_params.append(pname)
+            req_body = op.get("requestBody")
+            if isinstance(req_body, dict):
+                content_map = req_body.get("content", {})
+                json_media = content_map.get("application/json") if isinstance(content_map, dict) else None
+                if isinstance(json_media, dict) and isinstance(json_media.get("schema"), dict):
+                    bschema = resolve_schema(json_media["schema"])
+                    for bname, bprop in bschema.get("properties", {}).items():
+                        props[bname] = bprop
+                    for req_field in bschema.get("required", []):
+                        if req_field not in required:
+                            required.append(req_field)
+            desc = str(op.get("summary") or op.get("description") or f"Open Terminal {op_id} tool").strip()
+            params_schema = {"type": "object", "properties": props}
+            if required:
+                params_schema["required"] = required
+            tools_by_name[op_id] = {
+                "type": "function",
+                "function": {
+                    "name": op_id,
+                    "description": desc,
+                    "parameters": params_schema,
+                },
+            }
+            dispatch_map[op_id] = {
+                "method": method_name.upper(),
+                "path": route_path,
+                "query_params": query_params,
+                "path_params": path_params,
+                "parameters": params_schema,
+            }
+
+    final_tools = [tools_by_name[name] for name in sorted(tools_by_name)]
+    _OPEN_TERMINAL_SCHEMA_CACHE = (now, copy.deepcopy(final_tools), copy.deepcopy(dispatch_map))
+    return final_tools, dispatch_map
+
+
+def ensure_open_terminal_tools_in_request(data: dict) -> tuple[set[str], dict[str, dict]]:
+    """
+    Ensure Open Terminal tools are present in data['tools'] whenever Open Terminal
+    is enabled and healthy, even if Open WebUI omitted them from the request payload.
+    Returns (engine_injected_tool_names, dispatch_map).
+    """
+    if not OPEN_TERMINAL_ENABLED or is_background_aux_request(data):
+        return set(), {}
+    existing_specs = request_tool_specs(data)
+    capabilities = classify_tool_capabilities(existing_specs)
+    ot_tools, dispatch_map = fetch_open_terminal_tools()
+    if capabilities["shell"] and capabilities["host_files"]:
+        return set(), dispatch_map
+    if not open_terminal_is_healthy():
+        return set(), dispatch_map
+
+    existing_names = {spec["name"] for spec in existing_specs}
+    tools_list = data.get("tools")
+    if not isinstance(tools_list, list):
+        tools_list = []
+        data["tools"] = tools_list
+
+    injected: set[str] = set()
+    for tool_def in ot_tools:
+        tname = tool_def.get("function", {}).get("name", "")
+        if tname and tname not in existing_names:
+            tools_list.append(copy.deepcopy(tool_def))
+            injected.add(tname)
+
+    if injected:
+        log(
+            f"[OPEN-TERMINAL] Auto-attached {len(injected)} local Open Terminal tool(s) "
+            f"to request because Open Terminal is enabled on {OPEN_TERMINAL_HOST}:{OPEN_TERMINAL_PORT}"
+        )
+    return injected, dispatch_map
+
+
+def _host_fallback_open_terminal_tool(tool_name: str, args: dict) -> dict:
+    """Direct bare-metal fallback in OPEN_TERMINAL_CWD if an HTTP route on Open Terminal differs."""
+    base_cwd = Path(OPEN_TERMINAL_CWD).expanduser().resolve()
+    base_cwd.mkdir(parents=True, exist_ok=True)
+
+    def resolve_target(raw_path: str) -> Path:
+        p = Path(raw_path or ".").expanduser()
+        return p.resolve() if p.is_absolute() else (base_cwd / p).resolve()
+
+    if tool_name in {"run_command", "execute"}:
+        cmd_str = str(args.get("command") or "")
+        run_cwd = resolve_target(str(args.get("cwd") or base_cwd))
+        if not run_cwd.is_dir():
+            run_cwd = base_cwd
+        proc = subprocess.run(
+            ["/bin/bash", "-lc", cmd_str],
+            cwd=str(run_cwd),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return {"status": "done", "exit_code": proc.returncode, "output": out[:24000], "cwd": str(run_cwd)}
+    if tool_name == "list_files":
+        target = resolve_target(str(args.get("path") or args.get("directory") or "."))
+        if not target.exists():
+            return {"error": f"Path does not exist: {target}"}
+        if target.is_file():
+            return {"path": str(target), "type": "file", "size": target.stat().st_size}
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:250]:
+            entries.append({
+                "name": child.name,
+                "path": str(child),
+                "type": "directory" if child.is_dir() else "file",
+                "size": child.stat().st_size if child.is_file() else None,
+            })
+        return {"path": str(target), "entries": entries}
+    if tool_name == "read_file":
+        target = resolve_target(str(args.get("path") or ""))
+        if not target.is_file():
+            return {"error": f"File not found: {target}"}
+        text_content = target.read_text(encoding="utf-8", errors="replace")
+        lines = text_content.splitlines()
+        start = max(1, int(args.get("start_line") or 1))
+        end = int(args.get("end_line") or len(lines))
+        sliced = "\n".join(lines[start - 1:end])
+        return {"path": str(target), "content": sliced[:24000], "total_lines": len(lines)}
+    if tool_name == "write_file":
+        target = resolve_target(str(args.get("path") or ""))
+        content = str(args.get("content") or "")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"status": "ok", "path": str(target), "bytes_written": len(content.encode("utf-8"))}
+    if tool_name == "replace_file_content":
+        target = resolve_target(str(args.get("path") or ""))
+        if not target.is_file():
+            return {"error": f"File not found: {target}"}
+        old_text = target.read_text(encoding="utf-8")
+        find_str = str(args.get("target") or args.get("old_str") or args.get("search") or "")
+        rep_str = str(args.get("replacement") or args.get("new_str") or args.get("replace") or "")
+        if not find_str or find_str not in old_text:
+            return {"error": f"Target string not found in {target}"}
+        new_text = old_text.replace(find_str, rep_str, 1)
+        target.write_text(new_text, encoding="utf-8")
+        return {"status": "ok", "path": str(target), "bytes_written": len(new_text.encode("utf-8"))}
+    if tool_name == "display_file":
+        target = resolve_target(str(args.get("path") or ""))
+        return {
+            "status": "ok" if target.is_file() else "missing",
+            "path": str(target),
+            "exists": target.is_file(),
+            "size": target.stat().st_size if target.is_file() else 0,
+        }
+    if tool_name == "glob_search":
+        base = resolve_target(str(args.get("path") or "."))
+        pattern = str(args.get("pattern") or "*")
+        matches = [str(p) for p in sorted(base.rglob(pattern))[:200]]
+        return {"path": str(base), "pattern": pattern, "matches": matches}
+    if tool_name == "grep_search":
+        base = resolve_target(str(args.get("path") or "."))
+        pattern = str(args.get("pattern") or args.get("query") or "")
+        rx = re.compile(pattern)
+        results = []
+        files = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
+        for fpath in files[:200]:
+            try:
+                for idx, line in enumerate(fpath.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                    if rx.search(line):
+                        results.append({"path": str(fpath), "line": idx, "content": line[:400]})
+                        if len(results) >= 100:
+                            break
+            except Exception:
+                continue
+            if len(results) >= 100:
+                break
+        return {"path": str(base), "pattern": pattern, "matches": results}
+    return {"error": f"Unsupported fallback tool: {tool_name}"}
+
+
+def execute_open_terminal_tool_call(tool_name: str, raw_args, dispatch_map: dict[str, dict]) -> str:
+    """Execute an Open Terminal tool call against the local Open Terminal service (with host fallback)."""
+    if isinstance(raw_args, str):
+        try:
+            args = json.loads(raw_args) if raw_args.strip() else {}
+        except Exception:
+            args = {"command": raw_args} if tool_name in {"run_command", "execute"} else {}
+    elif isinstance(raw_args, dict):
+        args = copy.deepcopy(raw_args)
+    else:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    if tool_name in {"run_command", "execute"} and not args.get("cwd"):
+        args["cwd"] = OPEN_TERMINAL_CWD
+
+    route_info = dispatch_map.get(tool_name)
+    if not route_info:
+        _, fallback_dispatch = _builtin_open_terminal_tools()
+        route_info = fallback_dispatch.get(tool_name)
+
+    headers = {"Content-Type": "application/json", "X-Session-Id": "local-open-terminal"}
+    api_key = read_open_terminal_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if route_info and open_terminal_is_healthy():
+        method = route_info.get("method", "POST").upper()
+        route_path = route_info.get("path", "")
+        proc_id = str(args.get("process_id") or args.get("id") or "")
+        if "{process_id}" in route_path and proc_id:
+            route_path = route_path.replace("{process_id}", proc_id)
+        if "{id}" in route_path and proc_id:
+            route_path = route_path.replace("{id}", proc_id)
+
+        url = f"http://{OPEN_TERMINAL_HOST}:{OPEN_TERMINAL_PORT}{route_path}"
+        try:
+            if method in {"GET", "DELETE"}:
+                query_args = {
+                    k: v for k, v in args.items()
+                    if v is not None and k not in {"process_id", "id"}
+                }
+                resp = requests.request(method, url, headers=headers, params=query_args, timeout=60)
+            else:
+                resp = requests.request(method, url, headers=headers, json=args, timeout=60)
+
+            if resp.status_code < 400:
+                payload = resp.json() if resp.content else {"status": "ok"}
+                if (
+                    tool_name in {"run_command", "execute"}
+                    and isinstance(payload, dict)
+                    and payload.get("status") == "running"
+                    and payload.get("id")
+                ):
+                    pid = payload["id"]
+                    status_url = f"http://{OPEN_TERMINAL_HOST}:{OPEN_TERMINAL_PORT}/execute/{pid}/status"
+                    deadline = time.monotonic() + 25.0
+                    while time.monotonic() < deadline:
+                        time.sleep(0.35)
+                        sresp = requests.get(status_url, headers=headers, timeout=10)
+                        if sresp.status_code == 200:
+                            spayload = sresp.json()
+                            if isinstance(spayload, dict) and spayload.get("status") != "running":
+                                payload = spayload
+                                payload.setdefault("id", pid)
+                                break
+                text_out = json.dumps(payload, ensure_ascii=False)
+                return text_out[:28000]
+            log(f"[OPEN-TERMINAL] HTTP {resp.status_code} on {method} {route_path}; using direct host workspace fallback")
+        except Exception as exc:
+            log(f"[OPEN-TERMINAL] Request exception on {tool_name} ({exc}); using direct host workspace fallback")
+
+    fallback_result = _host_fallback_open_terminal_tool(tool_name, args)
+    return json.dumps(fallback_result, ensure_ascii=False)[:28000]
 
 # -----------------------------------------------------------------------------
 # Model-specific hard token bans for typographic dashes and standalone spaced hyphens.
@@ -855,6 +1560,25 @@ def get_dash_token_ids(model_path: str) -> list[int]:
         log(f"[DASH-BAN] WARNING: no dash token IDs found for {cache_key}; response fallback remains enabled")
     return token_ids
 
+
+def get_safe_dash_token_ids(model_path: str, preserve_cli_flags: bool = False) -> list[int]:
+    """
+    Return dash token IDs to ban via --logit-bias. When preserve_cli_flags=True
+    (for example when Open Terminal or function-calling tools are active), only
+    ban Unicode en/em-dash tokens so ASCII ' -' tokens needed for shell flags
+    (e.g. 'ls -la', 'python3 -c', 'uname -a') and negative numbers remain allowed.
+    Visible prose still has ' - ' normalized by normalize_visible_text().
+    """
+    all_ids = get_dash_token_ids(model_path)
+    if not preserve_cli_flags:
+        return all_ids
+    cache_key = str(Path(model_path).resolve())
+    try:
+        unicode_ids, _ = _read_dash_ids_from_gguf(cache_key)
+        return sorted(set(unicode_ids))
+    except Exception:
+        return []
+
 def looks_like_gguf(path: Path) -> bool:
     try:
         with path.open("rb") as f: return f.read(4) == b"GGUF"
@@ -942,6 +1666,19 @@ def generate_default_profile(model_id: str) -> dict:
         profile["cache_type_v"] = "f16"
         profile["cmoe"] = os.environ.get("LLAMA_CPU_MOE_ALL", "1") == "1"
         profile["ncmoe"] = int(os.environ.get("LLAMA_N_CPU_MOE", 16))
+
+    try:
+        _tot_gib, _free_gib, _ = detect_gpu_vram_gib()
+        if VISION_DEVICE_MODE == "cpu" or (_tot_gib is not None and _tot_gib <= VISION_LOW_VRAM_GB):
+            profile["ngl"] = 0
+            profile["flash_attn"] = False
+            profile["cache_type_k"] = "f16"
+            profile["cache_type_v"] = "f16"
+            profile["cmoe"] = True
+            profile["ncmoe"] = 0
+            profile["mmproj_cpu"] = True
+    except Exception:
+        pass
 
     return profile
 
@@ -1073,6 +1810,133 @@ def find_associated_mmproj(model_info: dict) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def llama_cli_supports(flag: str) -> bool:
+    """Return True if the selected llama-server binary advertises `flag` in --help."""
+    global _LLAMA_HELP_CACHE
+    if _LLAMA_HELP_CACHE is None:
+        try:
+            res = subprocess.run(
+                [LLAMA_BIN, "--help"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            _LLAMA_HELP_CACHE = (res.stdout or "") + "\n" + (res.stderr or "")
+        except Exception:
+            _LLAMA_HELP_CACHE = ""
+    return flag in _LLAMA_HELP_CACHE
+
+
+def build_cpu_only_env() -> dict[str, str]:
+    """
+    Build a process environment that hides GPU devices from CUDA, ROCm/HIP, and Vulkan
+    and instructs llama.cpp to keep model layers, multimodal projectors, KV cache, and
+    tensor operations strictly on CPU.
+    """
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["NVIDIA_VISIBLE_DEVICES"] = "void"
+    env["HIP_VISIBLE_DEVICES"] = ""
+    env["ROCR_VISIBLE_DEVICES"] = ""
+    env["GPU_DEVICE_ORDINAL"] = ""
+    env["HSA_ENABLE_SDMA"] = "0"
+    env["GGML_VK_VISIBLE_DEVICES"] = ""
+    env["LLAMA_ARG_N_GPU_LAYERS"] = "0"
+    env["LLAMA_ARG_MMPROJ_OFFLOAD"] = "0"
+    env["LLAMA_ARG_KV_OFFLOAD"] = "0"
+    env["LLAMA_ARG_DEVICE"] = "none"
+    return env
+
+
+def apply_cpu_only_llama_flags(cmd: list[str], has_mmproj: bool = True) -> list[str]:
+    """
+    Ensure a llama-server command line loads 100% of the model, projector (mmproj),
+    KV cache, and compute buffers onto CPU-only without triggering the quantized-V +
+    disabled-flash-attention startup error.
+    """
+    updated = list(cmd)
+    for flag, replacement in (("-ngl", "0"), ("-fa", "off"), ("-ctk", "f16"), ("-ctv", "f16")):
+        if flag in updated:
+            idx = updated.index(flag)
+            if idx + 1 < len(updated):
+                updated[idx + 1] = replacement
+        else:
+            updated += [flag, replacement]
+
+    if has_mmproj:
+        if "--no-mmproj-offload" not in updated:
+            updated.append("--no-mmproj-offload")
+        if llama_cli_supports("--mmproj-device") and "--mmproj-device" not in updated and "-mmdev" not in updated:
+            updated += ["--mmproj-device", "none"]
+        elif llama_cli_supports("-mmdev") and "-mmdev" not in updated and "--mmproj-device" not in updated:
+            updated += ["-mmdev", "none"]
+
+    if llama_cli_supports("--device") and "--device" not in updated and "-dev" not in updated:
+        updated += ["--device", "none"]
+    if llama_cli_supports("--no-kv-offload") and "--no-kv-offload" not in updated and "-nkvo" not in updated:
+        updated.append("--no-kv-offload")
+    elif llama_cli_supports("-nkvo") and "-nkvo" not in updated and "--no-kv-offload" not in updated:
+        updated.append("-nkvo")
+    if llama_cli_supports("--no-op-offload") and "--no-op-offload" not in updated:
+        updated.append("--no-op-offload")
+    if llama_cli_supports("--split-mode") and "--split-mode" not in updated and "-sm" not in updated:
+        updated += ["--split-mode", "none"]
+    if "-ncmoe" in updated:
+        idx = updated.index("-ncmoe")
+        if idx + 1 < len(updated):
+            del updated[idx:idx + 2]
+        if "-cmoe" not in updated:
+            updated.append("-cmoe")
+    return updated
+
+
+def should_force_cpu_for_project_model(model_info: dict, profile: dict) -> tuple[bool, bool, str]:
+    """
+    Determine (force_entire_model_cpu, force_projector_cpu, reason) for a project model
+    and its associated projector when running under low VRAM.
+    """
+    if VISION_DEVICE_MODE == "cpu" or model_info.get("_force_cpu", False):
+        return True, True, "CPU-only execution explicitly requested"
+    if int(profile.get("ngl", 28)) <= 0 or profile.get("force_cpu", False):
+        return True, True, "profile specifies ngl=0 / force_cpu"
+
+    total_gib, free_gib, source = detect_gpu_vram_gib()
+    model_gib = float(model_info.get("model_size_bytes", 0)) / (1024 ** 3)
+    mmproj_path = find_associated_mmproj(model_info)
+    mmproj_gib = (mmproj_path.stat().st_size / (1024 ** 3)) if (mmproj_path and mmproj_path.is_file()) else 0.0
+    other_model_holding_gpu = (
+        current_process is not None
+        and current_process.poll() is None
+        and int(getattr(current_process, "active_ngl", 0) or 0) > 0
+        and not getattr(current_process, "force_cpu", False)
+    )
+
+    if total_gib is not None:
+        if total_gib <= VISION_LOW_VRAM_GB:
+            return (
+                True,
+                True,
+                f"GPU total VRAM is {total_gib:.2f} GiB via {source} (<= {VISION_LOW_VRAM_GB:g} GiB low-VRAM threshold)",
+            )
+        if not other_model_holding_gpu and free_gib is not None and free_gib < VISION_MIN_FREE_VRAM_GB:
+            return (
+                True,
+                True,
+                f"GPU free VRAM is {free_gib:.2f} GiB via {source} (< {VISION_MIN_FREE_VRAM_GB:g} GiB minimum free threshold)",
+            )
+        if mmproj_path is not None:
+            avail = (free_gib if (free_gib is not None and not other_model_holding_gpu) else total_gib)
+            if (
+                profile.get("mmproj_cpu", False)
+                or total_gib <= max(VISION_LOW_VRAM_GB, 8.0)
+                or (model_gib + mmproj_gib + 1.5) > avail
+            ):
+                return (
+                    False,
+                    True,
+                    f"low VRAM headroom for projector ({avail:.2f} GiB available for {model_gib:.2f} GiB model + {mmproj_gib:.2f} GiB projector)",
+                )
+    return False, bool(profile.get("mmproj_cpu", False)), "sufficient VRAM"
+
+
 def build_llama_command(model_info: dict, use_native_tool_template: bool = False) -> list[str]:
     profile = load_or_create_profile(model_info["id"])
 
@@ -1166,6 +2030,35 @@ def build_llama_command(model_info: dict, use_native_tool_template: bool = False
     if dash_token_ids:
         # llama.cpp CLI uses TOKEN_ID-inf to hard-ban a token at sampling time.
         cmd += ["--logit-bias", ",".join(f"{token_id}-inf" for token_id in dash_token_ids)]
+
+    auto_model_cpu, auto_mmproj_cpu, cpu_reason = should_force_cpu_for_project_model(model_info, profile)
+    if auto_model_cpu:
+        log(f"[LOW-VRAM] Loading entire project model and any projector on CPU-only: {cpu_reason}")
+        cmd = apply_cpu_only_llama_flags(cmd, has_mmproj=(_mmproj_path is not None))
+    elif _mmproj_path is not None and auto_mmproj_cpu:
+        log(f"[LOW-VRAM] Keeping project model multimodal projector on CPU-only: {cpu_reason}")
+        if "--no-mmproj-offload" not in cmd:
+            cmd.append("--no-mmproj-offload")
+        if llama_cli_supports("--mmproj-device") and "--mmproj-device" not in cmd and "-mmdev" not in cmd:
+            cmd += ["--mmproj-device", "none"]
+        elif llama_cli_supports("-mmdev") and "-mmdev" not in cmd and "--mmproj-device" not in cmd:
+            cmd += ["-mmdev", "none"]
+
+    # Prevent llama.cpp startup failure: quantized V cache (-ctv q4_0/q8_0) requires Flash Attention (-fa on).
+    if "-fa" in cmd and cmd[cmd.index("-fa") + 1] == "off" and "-ctv" in cmd:
+        ctv_idx = cmd.index("-ctv") + 1
+        if ctv_idx < len(cmd) and cmd[ctv_idx].lower() not in {"f16", "f32", "bf16"}:
+            cmd[ctv_idx] = "f16"
+
+    # When native tool calling is active, keep only Unicode en/em-dash bans in --logit-bias
+    # so ASCII ' -' tokens needed for shell flags (e.g. 'ls -la') remain unblocked.
+    if use_native_tool_template and "--logit-bias" in cmd:
+        lb_idx = cmd.index("--logit-bias")
+        safe_ids = get_safe_dash_token_ids(model_info["model"], preserve_cli_flags=True)
+        if safe_ids and lb_idx + 1 < len(cmd):
+            cmd[lb_idx + 1] = ",".join(f"{token_id}-inf" for token_id in safe_ids)
+        elif not safe_ids:
+            del cmd[lb_idx:lb_idx + 2]
 
     return cmd
 
@@ -1272,6 +2165,7 @@ def build_vision_command(force_cpu: bool = False) -> list[str]:
     ]
     if force_cpu:
         cmd.append("--no-mmproj-offload")
+        cmd = apply_cpu_only_llama_flags(cmd, has_mmproj=True)
     dash_ids = get_dash_token_ids(str(model_path))
     if dash_ids:
         cmd += ["--logit-bias", ",".join(f"{token_id}-inf" for token_id in dash_ids)]
@@ -1296,6 +2190,40 @@ def detect_gpu_vram_gib() -> tuple[float | None, float | None, str]:
 
     # AMD and other Linux DRM drivers expose dedicated VRAM counters in sysfs.
     try:
+        drm_candidates: list[tuple[float, float | None, float, str]] = []
+        for _tp in sorted(Path("/sys/class/drm").glob("card*/device/mem_info_vram_total")):
+            try:
+                _tb = int(_tp.read_text().strip())
+                if _tb <= 0:
+                    continue
+                _up = _tp.with_name("mem_info_vram_used")
+                _ub = int(_up.read_text().strip()) if _up.is_file() else None
+                _vtp = _tp.with_name("mem_info_vis_vram_total")
+                _vup = _tp.with_name("mem_info_vis_vram_used")
+                if _vtp.is_file():
+                    try:
+                        _vt = int(_vtp.read_text().strip())
+                        if 0 < _vt < _tb:
+                            _tb = _vt
+                            if _vup.is_file():
+                                _ub = int(_vup.read_text().strip())
+                    except (OSError, ValueError):
+                        pass
+                _tg = _tb / (1024 ** 3)
+                _fg = max(0.0, (_tb - _ub) / (1024 ** 3)) if _ub is not None else None
+                _ug = (_ub / (1024 ** 3)) if _ub is not None else 0.0
+                drm_candidates.append((_tg, _fg, _ug, str(_tp)))
+            except (OSError, ValueError):
+                continue
+        if drm_candidates:
+            drm_candidates.sort(
+                key=lambda item: (
+                    0 if (item[1] is not None and item[1] < VISION_MIN_FREE_VRAM_GB) or item[0] <= VISION_LOW_VRAM_GB else 1,
+                    -item[2],
+                    item[1] if item[1] is not None else item[0],
+                )
+            )
+            return drm_candidates[0][0], drm_candidates[0][1], drm_candidates[0][3]
         for total_path in sorted(Path("/sys/class/drm").glob("card*/device/mem_info_vram_total")):
             try:
                 total_bytes = int(total_path.read_text().strip())
@@ -1339,6 +2267,28 @@ def choose_vision_attempts() -> tuple[list[bool], str]:
 
     total_gib, free_gib, source = detect_gpu_vram_gib()
     if VISION_DEVICE_MODE == "auto":
+        vision_files_gib = 0.0
+        for _vpath in (VISION_MODEL_PATH, VISION_MMPROJ_PATH):
+            try:
+                _vp = Path(_vpath).expanduser()
+                if _vp.is_file():
+                    vision_files_gib += _vp.stat().st_size / (1024 ** 3)
+            except Exception:
+                pass
+        required_free_gib = max(VISION_MIN_FREE_VRAM_GB, vision_files_gib + 1.0)
+        main_active_on_gpu = (
+            current_process is not None
+            and current_process.poll() is None
+            and int(getattr(current_process, "active_ngl", 0) or 0) > 0
+            and not getattr(current_process, "force_cpu", False)
+        )
+        active_main_gib = 0.0
+        if main_active_on_gpu:
+            active_id = getattr(current_process, "model_id", None)
+            if active_id and active_id in MODEL_MAP:
+                active_main_gib = float(MODEL_MAP[active_id].get("model_size_bytes", 0)) / (1024 ** 3)
+        if total_gib is None and main_active_on_gpu:
+            return [True], "GPU VRAM counters unavailable while main model is active on GPU; forcing CPU-only for sidecar and projector"
         if total_gib is None:
             log("[VISION] Could not reliably detect GPU VRAM; trying GPU first, with CPU fallback if enabled.")
         else:
@@ -1350,6 +2300,16 @@ def choose_vision_attempts() -> tuple[list[bool], str]:
                 return [True], f"GPU has {total_gib:.2f} GiB VRAM (<= {VISION_LOW_VRAM_GB:g} GiB threshold)"
             if free_gib is not None and free_gib < VISION_MIN_FREE_VRAM_GB:
                 return [True], f"only {free_gib:.2f} GiB VRAM free (< {VISION_MIN_FREE_VRAM_GB:g} GiB threshold)"
+            if free_gib is not None and free_gib < required_free_gib:
+                return [True], f"only {free_gib:.2f} GiB VRAM free (< {required_free_gib:.2f} GiB required for sidecar + projector)"
+            if main_active_on_gpu:
+                if free_gib is None:
+                    return [True], "free VRAM unknown while main model is offloaded to GPU; forcing CPU-only for sidecar and projector"
+                if total_gib <= max(VISION_LOW_VRAM_GB, 8.0) or (active_main_gib + vision_files_gib + 1.25) > total_gib:
+                    return [True], (
+                        f"main model ({active_main_gib:.2f} GiB) is active on {total_gib:.2f} GiB GPU; "
+                        "loading entire vision sidecar and projector on CPU-only"
+                    )
 
     # gpu mode explicitly prefers GPU. With the default fallback setting it
     # may still retry CPU-only if startup fails due to memory or backend errors.
@@ -1361,6 +2321,20 @@ def choose_vision_attempts() -> tuple[list[bool], str]:
 
 def ensure_vision_server() -> None:
     global vision_process
+    global _VISION_FORCE_CPU_OVERRIDE
+    _pre_attempts, _pre_reason = (
+        ([True], "CPU-only forced after GPU sidecar error or low-VRAM override")
+        if _VISION_FORCE_CPU_OVERRIDE
+        else choose_vision_attempts()
+    )
+    if (
+        vision_process is not None
+        and vision_process.poll() is None
+        and _pre_attempts[0]
+        and not getattr(vision_process, "force_cpu", False)
+    ):
+        log(f"[VISION] Active sidecar is on GPU but low-VRAM policy requires CPU-only ({_pre_reason}); restarting sidecar and projector on CPU-only.")
+        stop_vision_model()
     if vision_process is not None and vision_process.poll() is None:
         ok, message = wait_for_ready(vision_process, VISION_ALIAS, port=VISION_PORT)
         if ok:
@@ -1376,6 +2350,9 @@ def ensure_vision_server() -> None:
         )
 
     attempts, policy_reason = choose_vision_attempts()
+    if _VISION_FORCE_CPU_OVERRIDE:
+        attempts, policy_reason = [True], "CPU-only forced after GPU sidecar error or low-VRAM override"
+        _VISION_FORCE_CPU_OVERRIDE = False
     log(f"[VISION] Device policy selected {('CPU-only' if attempts[0] else 'GPU-first')}: {policy_reason}")
     last_error = "Vision sidecar failed to start."
 
@@ -1397,9 +2374,19 @@ def ensure_vision_server() -> None:
             logf.write(" ".join(cmd) + "\n\n")
             logf.flush()
             try:
+                _saved_vision_env = os.environ.copy()
+                if force_cpu:
+                    os.environ.update(build_cpu_only_env())
                 vision_process = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+                vision_process.force_cpu = force_cpu
+                if force_cpu:
+                    os.environ.clear()
+                    os.environ.update(_saved_vision_env)
             except Exception as exc:
                 vision_process = None
+                if force_cpu:
+                    os.environ.clear()
+                    os.environ.update(_saved_vision_env)
                 last_error = f"Could not launch vision sidecar: {exc}"
                 log(f"[VISION] {last_error}")
                 continue
@@ -1532,6 +2519,18 @@ def analyze_image_message(message: dict) -> str:
         json=payload,
         timeout=(10, 600),
     )
+    if response.status_code >= 400 and VISION_FALLBACK_CPU and not getattr(vision_process, "force_cpu", False):
+        global _VISION_FORCE_CPU_OVERRIDE
+        log(f"[VISION] GPU sidecar returned HTTP {response.status_code}; restarting entire vision sidecar and projector on CPU-only and retrying.")
+        response.close()
+        stop_vision_model()
+        _VISION_FORCE_CPU_OVERRIDE = True
+        ensure_vision_server()
+        response = requests.post(
+            f"http://127.0.0.1:{VISION_PORT}/v1/chat/completions",
+            json=payload,
+            timeout=(10, 600),
+        )
     if response.status_code >= 400:
         details = response.text[:1500]
         response.close()
@@ -1636,11 +2635,14 @@ def chat_completions():
     resp = None
     try:
         data = request.get_json(silent=True) or {}
+        engine_injected_ot_tools, ot_dispatch_map = ensure_open_terminal_tools_in_request(data)
         tool_names = request_tool_names(data)
         use_native_tool_template = bool(data.get("tools") or data.get("functions"))
         if tool_names:
             log(f"[TOOLS] Request exposes {len(tool_names)} tool/function(s): {', '.join(tool_names[:20])}" + (" ..." if len(tool_names) > 20 else ""))
         if inject_tool_routing_instructions(data, tool_names):
+            use_native_tool_template = True
+        if OPEN_TERMINAL_ENABLED:
             use_native_tool_template = True
         if "max_tokens" not in data and "max_completion_tokens" not in data:
             data["max_tokens"] = DEFAULT_MAX_TOKENS
@@ -1652,6 +2654,23 @@ def chat_completions():
         target_profile = load_or_create_profile(model_id)
         active_ngl = target_profile.get("ngl", 28)
         active_ctx = target_profile.get("ctx_size", 256000)
+        MODEL_MAP[model_id].pop("_force_cpu", None)
+        force_project_cpu, force_mmproj_cpu, _ = should_force_cpu_for_project_model(
+            MODEL_MAP[model_id], target_profile
+        )
+        if force_project_cpu:
+            active_ngl = 0
+            target_profile = dict(
+                target_profile,
+                ngl=0,
+                flash_attn=False,
+                cache_type_k="f16",
+                cache_type_v="f16",
+                force_cpu=True,
+            )
+            MODEL_MAP[model_id]["_force_cpu"] = True
+        elif force_mmproj_cpu:
+            target_profile = dict(target_profile, mmproj_cpu=True)
 
         cached_model = getattr(current_process, "model_id", None)
         cached_signature = getattr(current_process, "profile_signature", None)
@@ -1684,12 +2703,19 @@ def chat_completions():
                 logf.write(f"[ENGINE] Backend: {LLAMA_BACKEND_SELECTED} | Profile parameters:\n")
                 logf.write(" ".join(cmd) + "\n\n")
                 logf.flush()
+                _saved_llama_env = os.environ.copy()
+                if force_project_cpu:
+                    os.environ.update(build_cpu_only_env())
                 current_process = subprocess.Popen(cmd, stdout=logf, stderr=logf, preexec_fn=os.setsid)
+                if force_project_cpu:
+                    os.environ.clear()
+                    os.environ.update(_saved_llama_env)
 
             current_process.model_id = model_id
             current_process.active_ngl = active_ngl
             current_process.active_ctx = active_ctx
             current_process.profile_signature = profile_signature
+            current_process.force_cpu = force_project_cpu
             if LLAMA_PID_FILE:
                 try:
                     Path(LLAMA_PID_FILE).write_text(str(current_process.pid), encoding="utf-8")
@@ -1697,6 +2723,34 @@ def chat_completions():
                     log(f"[WARNING] Could not write llama PID file: {exc}")
 
         ok, message = wait_for_ready(current_process, model_id)
+        if not ok and not getattr(current_process, "force_cpu", False):
+            log(f"[LOW-VRAM] Project model startup on GPU failed ({message}); retrying entire model and projector on CPU-only...")
+            stop_current_model()
+            if wait_for_llama_port_free(timeout=5.0):
+                MODEL_MAP[model_id]["_force_cpu"] = True
+                cmd_cpu = build_llama_command(MODEL_MAP[model_id], use_native_tool_template=use_native_tool_template)
+                with open(LLAMA_LOG, "a", encoding="utf-8") as logf:
+                    logf.write(f"\n--- [HOT-RELOAD CPU FALLBACK] {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                    logf.write(" ".join(cmd_cpu) + "\n\n")
+                    logf.flush()
+                    _saved_fb_env = os.environ.copy()
+                    os.environ.update(build_cpu_only_env())
+                    try:
+                        current_process = subprocess.Popen(cmd_cpu, stdout=logf, stderr=logf, preexec_fn=os.setsid)
+                    finally:
+                        os.environ.clear()
+                        os.environ.update(_saved_fb_env)
+                current_process.model_id = model_id
+                current_process.active_ngl = 0
+                current_process.active_ctx = active_ctx
+                current_process.profile_signature = profile_signature
+                current_process.force_cpu = True
+                if LLAMA_PID_FILE:
+                    try:
+                        Path(LLAMA_PID_FILE).write_text(str(current_process.pid), encoding="utf-8")
+                    except Exception:
+                        pass
+                ok, message = wait_for_ready(current_process, model_id)
         if not ok:
             log(f"[ERROR] llama-server startup failed: {message}")
             stop_current_model()
@@ -1717,6 +2771,63 @@ def chat_completions():
                         "error": "This main model has no mmproj and the vision helper could not process the image.",
                         "details": str(exc),
                     }), 502
+
+        if engine_injected_ot_tools:
+            for _ot_round in range(10):
+                probe_payload = copy.deepcopy(data)
+                probe_payload["stream"] = False
+                try:
+                    probe_resp = requests.post(
+                        f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions",
+                        json=probe_payload,
+                        timeout=2400,
+                    )
+                except Exception as exc:
+                    log(f"[OPEN-TERMINAL] Probe completion failed: {exc}")
+                    break
+                if probe_resp.status_code >= 400:
+                    probe_resp.close()
+                    break
+                try:
+                    probe_json = probe_resp.json()
+                except Exception:
+                    probe_resp.close()
+                    break
+                probe_resp.close()
+                choices = probe_json.get("choices", []) if isinstance(probe_json, dict) else []
+                if not choices or not isinstance(choices[0], dict):
+                    break
+                assistant_msg = choices[0].get("message", {})
+                if not isinstance(assistant_msg, dict):
+                    break
+                tool_calls = assistant_msg.get("tool_calls")
+                if not isinstance(tool_calls, list) or not tool_calls:
+                    break
+                call_names = [
+                    str(tc.get("function", {}).get("name") or "")
+                    for tc in tool_calls if isinstance(tc, dict)
+                ]
+                if not call_names or not all(name in engine_injected_ot_tools for name in call_names):
+                    break
+                log(f"[OPEN-TERMINAL] Executing engine-bridged Open Terminal tool call(s) (round {_ot_round + 1}): {', '.join(call_names)}")
+                data.setdefault("messages", []).append({
+                    "role": "assistant",
+                    "content": assistant_msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                })
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                    t_name = str(fn.get("name") or "")
+                    t_args = fn.get("arguments", "{}")
+                    t_out = execute_open_terminal_tool_call(t_name, t_args, ot_dispatch_map)
+                    data["messages"].append({
+                        "role": "tool",
+                        "tool_call_id": str(tc.get("id") or f"call_{_ot_round}_{t_name}"),
+                        "name": t_name,
+                        "content": t_out,
+                    })
 
         try:
             resp = requests.post(
@@ -1898,6 +3009,7 @@ echo "[STATUS] Starting engine (CPU affinity: ${ENGINE_CPU_SET})..."
 export PROFILES_DIR LLAMA_BIN LLAMA_BACKEND_SELECTED MODEL_ROOT API_PORT LLAMA_PORT LLAMA_LOG LLAMA_PID_FILE
 export VISION_MODEL_PATH VISION_MMPROJ_PATH VISION_PORT VISION_LOG VISION_PID_FILE VISION_NGL VISION_CTX_SIZE VISION_BATCH VISION_UBATCH VISION_THREADS VISION_THREADS_BATCH VISION_MAX_TOKENS VISION_FALLBACK_CPU VISION_DEVICE_MODE VISION_LOW_VRAM_GB VISION_MIN_FREE_VRAM_GB
 export OPEN_TERMINAL_OUTPUT_DIR OPEN_TERMINAL_CHAT_UPLOADS
+export OPEN_TERMINAL_ENABLED OPEN_TERMINAL_HOST OPEN_TERMINAL_PORT OPEN_TERMINAL_CWD OPEN_TERMINAL_KEY_FILE
 export DEFAULT_CTX_SIZE DEFAULT_BATCH DEFAULT_UBATCH DEFAULT_MAX_TOKENS LLAMA_NGL LLAMA_CPU_MOE_ALL LLAMA_N_CPU_MOE LLAMA_PARALLEL LLAMA_CACHE_TYPE_K LLAMA_CACHE_TYPE_V LLAMA_FLASH_ATTN LLAMA_THREADS LLAMA_THREADS_BATCH LLAMA_NO_MMAP LLAMA_NO_WARMUP LLAMA_STARTUP_TIMEOUT
 
 if command -v taskset >/dev/null 2>&1 && taskset -c "$ENGINE_CPU_SET" true >/dev/null 2>&1; then
@@ -2014,6 +3126,11 @@ local = {
         ]
     },
 }
+local["path"] = "/openapi.json"
+local["config"]["enable"] = True
+local["config"]["working_directory_context"] = True
+local["config"]["user_shell_tools"] = "always"
+local["config"]["access_grants"].append({"principal_type": "user", "principal_id": "*", "permission": "write"})
 # Replace only this launcher's connection, preserving other env-defined entries.
 connections = [c for c in connections if not (isinstance(c, dict) and c.get("id") == local["id"])]
 connections.append(local)
@@ -2041,6 +3158,121 @@ export ENABLE_OLLAMA_API=False
 export ENABLE_OPENAI_API=True
 # Required for Open WebUI's built-in Open Terminal integration section.
 export ENABLE_TOOL_SERVERS=True
+export DEFAULT_MODEL_PARAMS="${DEFAULT_MODEL_PARAMS:-{\"function_calling\":\"native\"}}"
+export DEFAULT_MODEL_METADATA="${DEFAULT_MODEL_METADATA:-{\"capabilities\":{\"file_context\":true,\"vision\":true,\"file_upload\":true,\"web_search\":true,\"image_generation\":true,\"code_interpreter\":true,\"terminal\":true,\"citations\":true,\"status_updates\":true,\"usage\":true,\"builtin_tools\":true},\"terminalId\":\"local-open-terminal\"}}"
+if [[ "$OPEN_TERMINAL_ENABLED" == 1 && "$OPEN_TERMINAL_READY" == 1 && "$OPEN_TERMINAL_AUTOCONFIGURE" == 1 && -s "$OPEN_TERMINAL_KEY_FILE" ]]; then
+    python3 - "$WEBUI_DATA_DIR" "$OPEN_TERMINAL_PORT" "$OPEN_TERMINAL_KEY_FILE" "$OPEN_TERMINAL_CHAT_UPLOADS" <<'PYPRESEED_WEBUI_DB' || true
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+webui_data = Path(sys.argv[1]).expanduser()
+terminal_port = int(sys.argv[2])
+api_key = Path(sys.argv[3]).expanduser().read_text(encoding="utf-8").strip()
+chat_uploads = sys.argv[4].strip().lower()
+local_conn = {
+    "id": "local-open-terminal",
+    "name": "Local Open Terminal",
+    "enabled": True,
+    "url": f"http://127.0.0.1:{terminal_port}",
+    "path": "/openapi.json",
+    "key": api_key,
+    "auth_type": "bearer",
+    "config": {
+        "enable": True,
+        "chat_uploads": chat_uploads,
+        "working_directory_context": True,
+        "user_shell_tools": "always",
+        "access_grants": [
+            {"principal_type": "user", "principal_id": "*", "permission": "read"},
+            {"principal_type": "user", "principal_id": "*", "permission": "write"},
+        ],
+    },
+}
+for db_path in sorted(webui_data.rglob("*.db")):
+    if not db_path.is_file():
+        continue
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "config" in tables:
+                row = conn.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1").fetchone()
+                if row and row[1]:
+                    cfg = json.loads(row[1]) if isinstance(row[1], str) else {}
+                    if isinstance(cfg, dict):
+                        ts = cfg.setdefault("terminal_server", {})
+                        if isinstance(ts, dict):
+                            conns = ts.get("connections", [])
+                            if not isinstance(conns, list):
+                                conns = []
+                            conns = [c for c in conns if not (isinstance(c, dict) and c.get("id") == "local-open-terminal")]
+                            conns.append(local_conn)
+                            ts["connections"] = conns
+                        models_cfg = cfg.setdefault("models", {})
+                        if isinstance(models_cfg, dict):
+                            dparams = models_cfg.setdefault("default_params", {})
+                            if isinstance(dparams, dict):
+                                dparams["function_calling"] = "native"
+                            dmeta = models_cfg.setdefault("default_metadata", {})
+                            if isinstance(dmeta, dict):
+                                caps = dmeta.setdefault("capabilities", {})
+                                if isinstance(caps, dict):
+                                    caps["terminal"] = True
+                                    caps["builtin_tools"] = True
+                                dmeta["terminalId"] = "local-open-terminal"
+                        conn.execute("UPDATE config SET data = ? WHERE id = ?", (json.dumps(cfg), row[0]))
+            if "model" in tables:
+                for mrow in conn.execute("SELECT id, params, meta FROM model").fetchall():
+                    mid, raw_params, raw_meta = mrow
+                    try:
+                        mparams = json.loads(raw_params) if isinstance(raw_params, str) and raw_params.strip() else {}
+                        if not isinstance(mparams, dict):
+                            mparams = {}
+                    except Exception:
+                        mparams = {}
+                    try:
+                        mmeta = json.loads(raw_meta) if isinstance(raw_meta, str) and raw_meta.strip() else {}
+                        if not isinstance(mmeta, dict):
+                            mmeta = {}
+                    except Exception:
+                        mmeta = {}
+                    mparams["function_calling"] = "native"
+                    mcaps = mmeta.setdefault("capabilities", {})
+                    if isinstance(mcaps, dict):
+                        mcaps["terminal"] = True
+                        mcaps["builtin_tools"] = True
+                    mmeta["terminalId"] = "local-open-terminal"
+                    conn.execute(
+                        "UPDATE model SET params = ?, meta = ? WHERE id = ?",
+                        (json.dumps(mparams), json.dumps(mmeta), mid),
+                    )
+            if "user" in tables:
+                for urow in conn.execute("SELECT id, settings FROM user").fetchall():
+                    uid, raw_settings = urow
+                    try:
+                        uset = json.loads(raw_settings) if isinstance(raw_settings, str) and raw_settings.strip() else {}
+                        if not isinstance(uset, dict):
+                            continue
+                    except Exception:
+                        continue
+                    ui_set = uset.setdefault("ui", {})
+                    if isinstance(ui_set, dict):
+                        if "terminalServers" in ui_set and isinstance(ui_set["terminalServers"], list):
+                            ui_set["terminalServers"] = [
+                                s for s in ui_set["terminalServers"]
+                                if isinstance(s, dict) and not str(s.get("url", "")).endswith(f":{terminal_port}")
+                            ]
+                        ui_set["selectedTerminalId"] = "local-open-terminal"
+                    conn.execute("UPDATE user SET settings = ? WHERE id = ?", (json.dumps(uset), uid))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        continue
+PYPRESEED_WEBUI_DB
+fi
 export OPENAI_API_BASE_URL="http://127.0.0.1:${API_PORT}/v1"
 export OPENAI_API_KEY="MUxyyX0YO4i1LJ5NNQz13zga9GW941nSy971YX96hoU"
 export WEBUI_AUTH
@@ -2143,6 +3375,31 @@ def locate_admin_id(directory: Path) -> str | None:
 
 admin_id = locate_admin_id(webui_data)
 if not admin_id:
+    try:
+        _warm_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for _warm_path in ("/api/config", "/api/v1/auths/"):
+            try:
+                with _warm_opener.open(f"http://127.0.0.1:{webui_port}{_warm_path}", timeout=5) as _r:
+                    _ = _r.read()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    admin_id = locate_admin_id(webui_data)
+    if not admin_id:
+        for _db_path in sorted(webui_data.rglob("*.db")):
+            try:
+                _conn = sqlite3.connect(f"file:{_db_path.resolve().as_posix()}?mode=ro", uri=True, timeout=3)
+                try:
+                    _row = _conn.execute('SELECT "id" FROM "user" LIMIT 1').fetchone()
+                    if _row and _row[0]:
+                        admin_id = str(_row[0])
+                        break
+                finally:
+                    _conn.close()
+            except Exception:
+                continue
+if not admin_id:
     print("[WARNING] Could not find an admin user in the Open WebUI SQLite database; automatic terminal registration was not persisted.")
     print("[WARNING] Check WEBUI_DATA_DIR and confirm an Open WebUI admin account exists.")
     raise SystemExit(2)
@@ -2189,6 +3446,10 @@ local = {
         ]
     },
 }
+local["config"]["enable"] = True
+local["config"]["working_directory_context"] = True
+local["config"]["user_shell_tools"] = "always"
+local["config"]["access_grants"].append({"principal_type": "user", "principal_id": "*", "permission": "write"})
 connections = [c for c in connections if not (isinstance(c, dict) and c.get("id") == local["id"])]
 connections.append(local)
 status, saved = api_request("POST", {"TERMINAL_SERVER_CONNECTIONS": connections})
@@ -2208,6 +3469,47 @@ if not confirmed:
     print("[WARNING] Open WebUI accepted the terminal configuration request but verification did not find the enabled connection with the requested Chat Uploads mode.")
     raise SystemExit(5)
 print("[STATUS] Local Open Terminal connection is saved in Open WebUI and verified enabled.")
+
+models_cfg_url = f"http://127.0.0.1:{webui_port}/api/v1/configs/models"
+def generic_api_request(url: str, method: str, payload=None):
+    data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with opener.open(req, timeout=15) as response:
+            raw = response.read()
+            return response.status, json.loads(raw.decode("utf-8")) if raw else {}
+    except urllib.error.HTTPError as exc:
+        return exc.code, {}
+    except Exception:
+        return 0, {}
+
+m_status, m_cfg = generic_api_request(models_cfg_url, "GET")
+if m_status == 200 and isinstance(m_cfg, dict):
+    d_params = m_cfg.get("DEFAULT_MODEL_PARAMS")
+    if not isinstance(d_params, dict):
+        d_params = {}
+    d_params["function_calling"] = "native"
+    m_cfg["DEFAULT_MODEL_PARAMS"] = d_params
+
+    d_meta = m_cfg.get("DEFAULT_MODEL_METADATA")
+    if not isinstance(d_meta, dict):
+        d_meta = {}
+    d_caps = d_meta.get("capabilities")
+    if not isinstance(d_caps, dict):
+        d_caps = {}
+    for cap_key in ("file_context", "vision", "file_upload", "web_search", "image_generation", "code_interpreter", "terminal", "citations", "status_updates", "usage", "builtin_tools"):
+        d_caps.setdefault(cap_key, True)
+    d_caps["terminal"] = True
+    d_caps["builtin_tools"] = True
+    d_meta["capabilities"] = d_caps
+    d_meta["terminalId"] = "local-open-terminal"
+    m_cfg["DEFAULT_MODEL_METADATA"] = d_meta
+    generic_api_request(models_cfg_url, "POST", m_cfg)
 
 # Restore and preserve browser-based code features as well as terminal access.
 # Environment variables alone do not override old values in PersistentConfig DB.
