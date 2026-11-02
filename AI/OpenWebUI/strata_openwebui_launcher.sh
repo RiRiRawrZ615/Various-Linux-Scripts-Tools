@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
-# Open WebUI + llama.cpp safe launcher
-# Run from anywhere. Uses llama.cpp directly through a local OpenAI-compatible engine.py.
-# Safety rule: this launcher never uses broad pkill cleanup. It only stops PIDs it started.
+# Strata-enabled Open WebUI + llama.cpp universal launcher
+# Drop-in companion launcher; keep the original v4 launcher untouched.
+# Runs the existing llama.cpp engine and adds every prepared Strata profile
+# from ~/strata/profiles/index.tsv (or legacy strata-<quant>.json configs).
+# Safety rule: no broad pkill cleanup; only launcher-managed PIDs are stopped.
 
 set -Eeuo pipefail
 
@@ -149,8 +151,7 @@ elif has_amd_gpu; then
     if [[ -d "$STRATA_DIR/.venv/lib" ]]; then
         mapfile -t STRATA_ROCM_LIBS < <(
             find "$STRATA_DIR/.venv/lib" -type d \
-                \( -path '*/_rocm_sdk_devel/lib' -o -path '*/_rocm_sdk_libraries_gfx103X_all/lib' \
-                   -o -path '*/_rocm_sdk_libraries_gfx110X_dgpu/lib' -o -path '*/_rocm_sdk_libraries_gfx120X_all/lib' \) \
+                \( -path '*/_rocm_sdk_devel/lib' -o -path '*/_rocm_sdk_libraries_*/lib' \) \
                 -print 2>/dev/null | sort -u
         )
         if ((${#STRATA_ROCM_LIBS[@]})); then
@@ -3656,7 +3657,8 @@ done
 
 echo "[STATUS] Engine is ready. Profiles mapped to: $PROFILES_DIR"
 echo "[STRATA] Add-on configured: $STRATA_DIR | GPU: $STRATA_GPU_BACKEND | profile selection: ${STRATA_PROFILE} | model folder: ${STRATA_MODEL_DIR:-auto-discovered} | config: ${STRATA_CONFIG:-auto from profile index/root configs} | API port: $STRATA_PORT"
-echo "[STRATA] Profiles are auto-discovered across quantizations; registered Strata source folders are excluded from llama.cpp discovery."
+echo "[STRATA] Profile index: $STRATA_PROFILE_INDEX"
+echo "[STRATA] All prepared profiles are discovered across quantizations; registered Strata source folders are excluded from llama.cpp discovery."
 
 # -----------------------------
 # Start Open Terminal (bare metal; optional)
