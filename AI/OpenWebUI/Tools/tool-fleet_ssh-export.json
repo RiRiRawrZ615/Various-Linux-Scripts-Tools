@@ -1,0 +1,169 @@
+[
+  {
+    "version_id": "63163f3f-98cb-49b8-9a48-e20fa0b8d6c7",
+    "id": "fleet_ssh",
+    "user_id": null,
+    "name": "Fleet SSH + RustDesk",
+    "meta": {
+      "i18n": null,
+      "description": "Runs shell commands, moves files, and inspects machines across your own fleet over SSH (shared key auth), plus RustDesk peer lookup and GUI session launch. SSH is the command channel; the installed RustDesk build is UI-only and cannot be scripted.",
+      "manifest": {
+        "title": "Fleet SSH + RustDesk",
+        "author": "RiRiRawrZ615",
+        "description": "Runs shell commands, moves files, and inspects machines across your own fleet over SSH (shared key auth), plus RustDesk peer lookup and GUI session launch. SSH is the command channel; the installed RustDesk build is UI-only and cannot be scripted.",
+        "version": "1.1.0",
+        "license": "MIT"
+      },
+      "has_user_valves": false
+    },
+    "is_active": true,
+    "access_grants": [],
+    "updated_at": 1793752708,
+    "created_at": 1793752708,
+    "user": null,
+    "write_access": true,
+    "content": "\"\"\"\ntitle: Fleet SSH + RustDesk\nauthor: RiRiRawrZ615\ndescription: Runs shell commands, moves files, and inspects machines across your own fleet over SSH (shared key auth), plus RustDesk peer lookup and GUI session launch. SSH is the command channel; the installed RustDesk build is UI-only and cannot be scripted.\nversion: 1.1.0\nlicense: MIT\n\"\"\"\n\nfrom __future__ import annotations\n\nimport os\nimport re\nimport shlex\nimport subprocess\nimport time\nfrom pathlib import Path\n\nfrom pydantic import BaseModel\n\n\nSSH_KEY = os.path.expanduser(\"~/.ssh/id_ed25519\")\n\n# Optional secondary key location (network share, offline backup). Leave empty to disable.\nBACKUP_KEY = os.environ.get(\"FLEET_BACKUP_KEY\", \"\")\n\nRUSTDESK_CONF = Path(os.path.expanduser(\"~/.config/rustdesk\"))\n\n\ndef _hosts() -> dict:\n    \"\"\"Static host catalog: name -> (ssh target, rustdesk id).\n\n    Replace with your own machines. Keys are the friendly names you can pass to any method;\n    the first value is the address the tool connects to (Tailscale IP, LAN IP, or hostname).\n    Leave it empty and pass a raw IP/ID as `target` instead, or let Fleet Ops build the catalog.\n    \"\"\"\n    return {\n        # \"box1\": (\"100.64.0.10\", \"123456789\"),\n        # \"box2\": (\"192.0.2.20\", \"987654321\"),\n    }\n\n\ndef _resolve(target: str) -> tuple:\n    \"\"\"Resolve a friendly name, Tailscale IP, or LAN IP to (host, machine name).\"\"\"\n    key = target.strip().lower()\n    table = _hosts()\n    if key in table:\n        ip, rid = table[key]\n        return (ip, key)\n    for name, (ip, rid) in table.items():\n        if target in (ip, rid):\n            return (target, name)\n    return (target, key)\n\n\ndef _key(valves: Valves) -> str:\n    \"\"\"Prefer the Valves key; fall back to the backup key path.\"\"\"\n    key = valves.ssh_key\n    if Path(key).is_file():\n        return key\n    if valves.backup_key and Path(valves.backup_key).is_file():\n        return valves.backup_key\n    return key\n\n\ndef _ssh_base(valves: Valves, host: str, user: str = \"\") -> list:\n    user = user or valves.default_user\n    key = _key(valves)\n    base = [\n        \"ssh\",\n        \"-o\", \"BatchMode=yes\",\n        \"-o\", f\"ConnectTimeout={int(valves.connect_timeout)}\",\n        \"-o\", \"StrictHostKeyChecking=accept-new\",\n        \"-o\", \"ServerAliveInterval=5\",\n    ]\n    if Path(key).is_file():\n        base += [\"-i\", key]\n    base.append(f\"{user}@{host}\")\n    return base\n\n\ndef _run(cmd: list, timeout: int) -> tuple:\n    try:\n        p = subprocess.run(\n            cmd,\n            capture_output=True,\n            text=True,\n            timeout=timeout,\n            errors=\"replace\",\n        )\n        return p.returncode, (p.stdout or \"\").strip(), (p.stderr or \"\").strip()\n    except subprocess.TimeoutExpired:\n        return 124, \"\", f\"timed out after {timeout}s\"\n    except Exception as exc:\n        return 1, \"\", f\"error: {exc}\"\n\n\ndef _peers() -> list:\n    \"\"\"Read RustDesk's peer database for names, platforms, LAN IPs, online state.\"\"\"\n    out = []\n    path = RUSTDESK_CONF / \"RustDesk_lan_peers.toml\"\n    if not path.is_file():\n        return out\n    text = path.read_text(encoding=\"utf-8\", errors=\"replace\")\n    for block in re.split(r\"\\n\\[\\[peers\\]\\]\\n\", text)[1:]:\n        peer = {}\n        for line in block.splitlines():\n            m = re.match(r\"^(\\w+) = (?:'(.*)'|(true|false))$\", line.strip())\n            if m:\n                peer[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)\n            elif line.startswith(\"[peers.ip_mac]\"):\n                ipm = re.search(r'\"([\\d.]+)\"', block[block.find(\"[peers.ip_mac]\"):])\n                if ipm:\n                    peer[\"lan_ip\"] = ipm.group(1)\n        if peer:\n            out.append(peer)\n    return out\n\n\nclass Valves(BaseModel):\n    default_user: str = os.environ.get(\"USER\", \"youruser\")\n    ssh_key: str = SSH_KEY\n    backup_key: str = BACKUP_KEY\n    rustdesk_password: str = \"\"            # set in Valves; never commit a real password here\n    sudo_password: str = \"\"                # set in Valves; never commit a real password here\n    connect_timeout: int = 6\n    exec_timeout: int = 25\n\n\nclass Tools:\n    def __init__(self, valves: Valves = Valves()):\n        self.valves = valves\n\n    def fleet(self) -> str:\n        \"\"\"List all machines: name, SSH target (Tailscale IP), RustDesk ID, platform, online state.\"\"\"\n        table = _hosts()\n        peers = {p.get(\"id\"): p for p in _peers()}\n        lines = []\n        for name, (ip, rid) in table.items():\n            peer = peers.get(rid, {})\n            lines.append(\n                f\"{name:<20} {ip:<16} rd={rid:<11} {peer.get('platform', '?'):<8} \"\n                f\"lan={peer.get('lan_ip', '-'):<14} {'online' if peer.get('online') == 'true' else 'offline'}\"\n            )\n        if not lines:\n            # No static catalog, so fall back to whatever RustDesk has seen on the LAN.\n            peers = _peers()\n            if not peers:\n                return \"no peers found: add entries to the host catalog or run RustDesk once on the LAN\"\n            return \"\\n\".join(\n                f\"{p.get('id', '?'):<12} {p.get('hostname', '?'):<20} {p.get('platform', '?'):<8} \"\n                f\"lan={p.get('lan_ip', '-'):<14} {'online' if p.get('online') == 'true' else 'offline'}\"\n                for p in peers\n            )\n        return \"\\n\".join(lines)\n\n    def run(self, target: str, command: str) -> str:\n        \"\"\"Run a shell command on a remote machine over SSH (key auth).\n\n        Args:\n            target: machine name from the host catalog, Tailscale IP, or LAN IP\n            command: shell command to execute on the remote machine\n        \"\"\"\n        host, name = _resolve(target)\n        cmd = _ssh_base(self.valves, host) + [command]\n        code, out, err = _run(cmd, int(self.valves.exec_timeout))\n        head = f\"[{name} | {host}] exit={code}\"\n        return f\"{head}\\n{out or err or '(no output)'}\"\n\n    def run_sudo(self, target: str, command: str) -> str:\n        \"\"\"Run a command on a remote machine as root.\n\n        Note on many distros: 'sudo -n' fails because the sudo policy still requires an\n        authentication exchange, but PAM accepts any input on stdin (passwd -d), so piping\n        the password from Valves to 'sudo -S' authenticates. Always pipe; never rely on sudo -n.\n        Set sudo_password in Valves; do not hardcode it in the tool.\n\n        Args:\n            target: machine name or IP\n            command: the command to run as root (without a leading 'sudo')\n        \"\"\"\n        host, name = _resolve(target)\n        pw = self.valves.sudo_password\n        if not pw:\n            return \"sudo_password is not set in Valves\"\n        remote = f\"printf %s\\\\n {shlex.quote(pw)} | sudo -S -p '' {command}\"\n        cmd = _ssh_base(self.valves, host) + [remote]\n        code, out, err = _run(cmd, int(self.valves.exec_timeout))\n        err = re.sub(r\"^\\[sudo.*?\\]\\s*\\n\", \"\", err)\n        return f\"[{name} | {host}] sudo exit={code}\\n{out or err or '(no output)'}\"\n\n    def push(self, target: str, local_path: str, remote_path: str) -> str:\n        \"\"\"Copy a file from this machine to a remote machine over SSH.\n\n        Args:\n            target: machine name or IP\n            local_path: path on this machine\n            remote_path: destination path on the target machine\n        \"\"\"\n        host, name = _resolve(target)\n        src = Path(local_path).expanduser()\n        if not src.is_file():\n            return f\"local file not found: {src}\"\n        key = _key(self.valves)\n        cmd = [\"scp\", \"-o\", \"BatchMode=yes\", \"-o\", f\"ConnectTimeout={int(self.valves.connect_timeout)}\",\n               \"-o\", \"StrictHostKeyChecking=accept-new\"]\n        if Path(key).is_file():\n            cmd += [\"-i\", key]\n        cmd += [str(src), f\"{self.valves.default_user}@{host}:{remote_path}\"]\n        code, out, err = _run(cmd, int(self.valves.exec_timeout) + 10)\n        if code == 0:\n            return f\"copied {src} -> {name}:{remote_path}\"\n        return f\"scp failed exit={code}\\n{out or err}\"\n\n    def pull(self, target: str, remote_path: str, local_path: str) -> str:\n        \"\"\"Copy a file from a remote machine to this machine.\n\n        Args:\n            target: machine name or IP\n            remote_path: path on the target machine\n            local_path: destination path on this machine\n        \"\"\"\n        host, name = _resolve(target)\n        key = _key(self.valves)\n        cmd = [\"scp\", \"-o\", \"BatchMode=yes\", \"-o\", f\"ConnectTimeout={int(self.valves.connect_timeout)}\",\n               \"-o\", \"StrictHostKeyChecking=accept-new\"]\n        if Path(key).is_file():\n            cmd += [\"-i\", key]\n        dest = Path(local_path).expanduser()\n        dest.parent.mkdir(parents=True, exist_ok=True)\n        cmd += [f\"{self.valves.default_user}@{host}:{remote_path}\", str(dest)]\n        code, out, err = _run(cmd, int(self.valves.exec_timeout) + 10)\n        if code == 0 and dest.is_file():\n            return f\"saved {name}:{remote_path} -> {dest} ({dest.stat().st_size} bytes)\"\n        return f\"scp failed exit={code}\\n{out or err}\"\n\n    def rustdesk(self, target: str, launch: bool = False) -> str:\n        \"\"\"RustDesk info for a machine, and optionally open a GUI session.\n\n        The installed RustDesk is the Flutter UI binary, not rustdesk-cli, so it cannot be\n        scripted for headless control. This reports the peer record and can only open the\n        interactive window. If launch=True, a session window is opened on this machine's\n        desktop using the password from Valves.\n\n        Args:\n            target: machine name or IP\n            launch: open the RustDesk session window (GUI, requires a display)\n        \"\"\"\n        host, name = _resolve(target)\n        peers = {p.get(\"id\"): p for p in _peers()}\n        table = _hosts()\n        rid = table.get(name, (None, None))[1]\n        if not rid:\n            return f\"no RustDesk id for {name} (add it to the host catalog)\"\n        peer = peers.get(rid, {})\n        info = f\"rustdesk id={rid} name={name} platform={peer.get('platform', '?')} online={peer.get('online', '?')}\"\n        if not launch:\n            return info + \"\\n(UI-only build: no scripted remote execution; use run() for commands)\"\n        if not os.environ.get(\"DISPLAY\") and not os.environ.get(\"WAYLAND_DISPLAY\"):\n            return info + \"\\ncannot launch: no display available in this process environment\"\n        password = self.valves.rustdesk_password\n        code, out, err = _run([\"xdg-open\", f\"rustdesk://{rid}?password={password}\"], 10)\n        if code != 0:\n            code, out, err = _run([\"rustdesk\", rid, password], 10)\n        return f\"{info}\\nlaunch exit={code}\\n{out or err or 'session window opening'}\"\n\n    def check(self, target: str) -> str:\n        \"\"\"Test SSH connectivity to a machine: key auth, hostname, OS, sudo state.\n\n        Args:\n            target: machine name or IP\n        \"\"\"\n        host, name = _resolve(target)\n        t0 = time.time()\n        cmd = _ssh_base(self.valves, host) + [\n            \"hostname; uname -r; head -1 /etc/os-release 2>/dev/null; \"\n            \"sudo -k; printf '\\\\n' | sudo -S -p '' id >/dev/null 2>&1 \"\n            \"&& echo 'sudo: stdin auth accepted' || echo 'sudo: stdin auth rejected'\"\n        ]\n        code, out, err = _run(cmd, int(self.valves.connect_timeout) + 8)\n        dt = round(time.time() - t0, 2)\n        if code == 0:\n            return f\"[{name} | {host}] reachable in {dt}s\\n{out}\"\n        return f\"[{name} | {host}] unreachable exit={code} in {dt}s\\n{err}\"\n",
+    "specs": [
+      {
+        "name": "check",
+        "description": "Test SSH connectivity to a machine: key auth, hostname, OS, sudo state.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "fleet",
+        "description": "List all machines: name, SSH target (Tailscale IP), RustDesk ID, platform, online state.",
+        "parameters": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        }
+      },
+      {
+        "name": "pull",
+        "description": "Copy a file from a remote machine to this machine.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "remote_path": {
+              "description": "path on the target machine",
+              "type": "string"
+            },
+            "local_path": {
+              "description": "destination path on this machine",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "remote_path",
+            "local_path"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "push",
+        "description": "Copy a file from this machine to a remote machine over SSH.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "local_path": {
+              "description": "path on this machine",
+              "type": "string"
+            },
+            "remote_path": {
+              "description": "destination path on the target machine",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "local_path",
+            "remote_path"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "run",
+        "description": "Run a shell command on a remote machine over SSH (key auth).",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name from the host catalog, Tailscale IP, or LAN IP",
+              "type": "string"
+            },
+            "command": {
+              "description": "shell command to execute on the remote machine",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "run_sudo",
+        "description": "Run a command on a remote machine as root.\n\nNote on many distros: 'sudo -n' fails because the sudo policy still requires an\nauthentication exchange, but PAM accepts any input on stdin (passwd -d), so piping\nthe password from Valves to 'sudo -S' authenticates. Always pipe; never rely on sudo -n.\nSet sudo_password in Valves; do not hardcode it in the tool.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "command": {
+              "description": "the command to run as root (without a leading 'sudo')",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "rustdesk",
+        "description": "RustDesk info for a machine, and optionally open a GUI session.\n\nThe installed RustDesk is the Flutter UI binary, not rustdesk-cli, so it cannot be\nscripted for headless control. This reports the peer record and can only open the\ninteractive window. If launch=True, a session window is opened on this machine's\ndesktop using the password from Valves.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "launch": {
+              "default": false,
+              "type": "boolean",
+              "description": "open the RustDesk session window (GUI, requires a display)"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  }
+]

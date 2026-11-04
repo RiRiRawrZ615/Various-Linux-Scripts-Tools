@@ -1,0 +1,294 @@
+[
+  {
+    "version_id": "9a94e92e-0449-44fa-8ed0-e91688101897",
+    "id": "fleet_ops",
+    "user_id": null,
+    "name": "Fleet Ops",
+    "meta": {
+      "i18n": null,
+      "description": "Fleet control for your own machines. SSH command execution, persistent tmux-backed sessions (OpenTerminal style), wireless ADB, and a portable encrypted per-host credential vault with identity-based smart detection. Instructions live in the method docstrings.",
+      "manifest": {
+        "title": "Fleet Ops",
+        "author": "RiRiRawrZ615",
+        "description": "Fleet control for your own machines. SSH command execution, persistent tmux-backed sessions (OpenTerminal style), wireless ADB, and a portable encrypted per-host credential vault with identity-based smart detection. Instructions live in the method docstrings.",
+        "version": "1.1.0",
+        "license": "MIT"
+      },
+      "has_user_valves": false
+    },
+    "is_active": true,
+    "access_grants": [],
+    "updated_at": 1793752708,
+    "created_at": 1793752708,
+    "user": null,
+    "write_access": true,
+    "content": "\"\"\"\ntitle: Fleet Ops\nauthor: RiRiRawrZ615\ndescription: Fleet control for your own machines. SSH command execution, persistent tmux-backed sessions (OpenTerminal style), wireless ADB, and a portable encrypted per-host credential vault with identity-based smart detection. Instructions live in the method docstrings.\nversion: 1.1.0\nlicense: MIT\n\"\"\"\nimport hashlib\nimport hmac\nimport json\nimport os\nimport re\nimport shlex\nimport subprocess\nimport time\nfrom pathlib import Path\n\nfrom pydantic import BaseModel\n\n# Working directory for the vault and session state. Override with FLEET_VAULT_DIR or Valves.\nLOCAL_DIR = Path(os.environ.get(\"FLEET_VAULT_DIR\", str(Path.home() / \".fleet_ops\")))\n\n# Seed catalog. Identity is machine_id, not IP, so IPs can drift.\n# Fill this with your own machines, or leave it empty and let the vault build itself\n# from check(), probe(), and ingest() as you discover hosts.\nSEED = {\n    # \"box1\": {\n    #     \"machine_id\": \"\",                        # /etc/machine-id, learned on first contact\n    #     \"aliases\": [\"box1\", \"192.0.2.10\", \"100.64.0.10\"],\n    #     \"user\": \"youruser\",\n    #     \"rustdesk_id\": \"\",\n    #     \"kind\": \"linux\",                         # linux | windows | android\n    # },\n}\n\n\nclass Valves(BaseModel):\n    master_passphrase: str = \"change-me\"          # REQUIRED: set your own, or the vault is not private\n    vault_dir: str = str(LOCAL_DIR)\n    backup_dir: str = os.environ.get(\"FLEET_BACKUP_DIR\", \"\")   # empty = mirror disabled\n    ssh_key: str = os.path.expanduser(\"~/.ssh/id_ed25519\")\n    default_user: str = os.environ.get(\"USER\", \"youruser\")\n    adb_port: int = 5555\n    connect_timeout: int = 6\n    exec_timeout: int = 25\n\n\ndef _hash_pw(password: str, salt: str) -> str:\n    return hashlib.sha256((salt + \"|\" + password).encode()).hexdigest()\n\n\ndef _derive_key(passphrase: str, salt: str) -> bytes:\n    return hashlib.pbkdf2_hmac(\"sha256\", passphrase.encode(), salt.encode(), 120000)\n\n\ndef _keystream(key: bytes, nonce: str, length: int) -> bytes:\n    \"\"\"HMAC-SHA256 counter-mode keystream (stdlib-only, no external deps).\"\"\"\n    out = b\"\"\n    counter = 0\n    while len(out) < length:\n        out += hmac.new(key, nonce.encode() + counter.to_bytes(4, \"big\"), hashlib.sha256).digest()\n        counter += 1\n    return out[:length]\n\n\ndef _encrypt(text: str, passphrase: str, salt: str) -> dict:\n    key = _derive_key(passphrase, salt)\n    nonce = hashlib.sha256((salt + str(time.time_ns())).encode()).hexdigest()[:16]\n    data = text.encode()\n    ct = bytes(b ^ k for b, k in zip(data, _keystream(key, nonce, len(data))))\n    mac = hmac.new(key, nonce.encode() + ct, hashlib.sha256).hexdigest()[:32]\n    return {\"nonce\": nonce, \"ct\": ct.hex(), \"mac\": mac}\n\n\ndef _decrypt(blob: dict, passphrase: str, salt: str) -> str:\n    key = _derive_key(passphrase, salt)\n    ct = bytes.fromhex(blob[\"ct\"])\n    if hmac.new(key, blob[\"nonce\"].encode() + ct, hashlib.sha256).hexdigest()[:32] != blob[\"mac\"]:\n        raise ValueError(\"vault entry failed integrity check (wrong passphrase or corrupted entry)\")\n    return bytes(b ^ k for b, k in zip(ct, _keystream(key, blob[\"nonce\"], len(ct)))).decode()\n\n\nclass Tools:\n    def __init__(self, valves: Valves = Valves()):\n        self.valves = valves\n        self.vault_path = Path(valves.vault_dir) / \"vault.json\"\n\n    def _key(self) -> str:\n        \"\"\"Local key first. If this machine has no copy, pull it from the backup dir.\"\"\"\n        local = Path(self.valves.ssh_key)\n        if local.is_file():\n            return str(local)\n        if not self.valves.backup_dir:\n            return \"\"\n        backup = Path(self.valves.backup_dir) / \"id_ed25519\"\n        if backup.is_file():\n            local.parent.mkdir(parents=True, exist_ok=True)\n            try:\n                local.write_bytes(backup.read_bytes())\n                local.chmod(0o600)\n                return str(local)\n            except Exception:\n                return str(backup)\n        # Some mounts (network shares, FUSE) do not honor chmod, so everything reports 0755 and\n        # ssh will refuse any key read straight from them. Always land the key in a real local\n        # dir with 600 perms before using it.\n        alt = Path(self.valves.backup_dir) / \"id_rsa\"\n        if alt.is_file():\n            local.parent.mkdir(parents=True, exist_ok=True)\n            try:\n                local.write_bytes(alt.read_bytes())\n                local.chmod(0o600)\n                return str(local)\n            except Exception:\n                return str(alt)\n        return \"\"\n\n    # ------------------------------------------------------------------ vault\n    def _load_vault(self, create: bool = True) -> dict:\n        \"\"\"Check the local vault first; if missing, pull the copy from the backup dir.\"\"\"\n        if not self.vault_path.is_file():\n            if self.valves.backup_dir:\n                backup = Path(self.valves.backup_dir) / \"vault.json\"\n                if backup.is_file():\n                    self.vault_path.parent.mkdir(parents=True, exist_ok=True)\n                    self.vault_path.write_text(backup.read_text(), encoding=\"utf-8\")\n                    return json.loads(self.vault_path.read_text(encoding=\"utf-8\"))\n            if not create:\n                return {}\n            self.vault_path.parent.mkdir(parents=True, exist_ok=True)\n            salt = hashlib.sha256((\"fleet|\" + self.valves.master_passphrase).encode()).hexdigest()[:16]\n            vault = {\"version\": 2, \"salt\": salt, \"hosts\": {}}\n            self.vault_path.write_text(json.dumps(vault, indent=2), encoding=\"utf-8\")\n            return vault\n        return json.loads(self.vault_path.read_text(encoding=\"utf-8\"))\n\n    def _save_vault(self, vault: dict) -> None:\n        self.vault_path.write_text(json.dumps(vault, indent=2), encoding=\"utf-8\")\n        if not self.valves.backup_dir:\n            return\n        backup = Path(self.valves.backup_dir)\n        if backup.is_dir():\n            try:\n                backup.joinpath(\"vault.json\").write_text(json.dumps(vault, indent=2), encoding=\"utf-8\")\n            except Exception:\n                pass  # backup mirror is best effort\n\n    def vault(self, action: str = \"list\", host: str = \"\", password: str = \"\") -> str:\n        \"\"\"Read or update the credential vault.\n\n        Each host stores: machine_id (stable identity), aliases (names + IPs), ssh user,\n        RustDesk ID, the password hash for verification, and the encrypted password.\n        The file is portable, so the same vault works on any machine as long as the\n        master passphrase matches. Lookup order is local vault first, then the backup copy.\n\n        :param action: list, show, verify, set, or where\n        :param host: host name or alias\n        :param password: password to verify or store\n        \"\"\"\n        vault = self._load_vault()\n        salt = vault[\"salt\"]\n        if action == \"where\":\n            backup_note = \"disabled\" if not self.valves.backup_dir else f\"{Path(self.valves.backup_dir) / 'vault.json'} (exists: {Path(self.valves.backup_dir).is_dir()})\"\n            return f\"local: {self.vault_path}\\nbackup: {backup_note}\"\n        hosts = vault.get(\"hosts\", {})\n        entry = hosts.get(host)\n        if entry is None:\n            for name, rec in hosts.items():\n                if host in rec.get(\"aliases\", []):\n                    entry, host = rec, name\n                    break\n        if entry is None and action == \"set\" and host in SEED:\n            entry = {\"machine_id\": SEED[host][\"machine_id\"], \"aliases\": list(SEED[host][\"aliases\"]),\n                     \"user\": SEED[host][\"user\"], \"rustdesk_id\": SEED[host][\"rustdesk_id\"], \"kind\": SEED[host][\"kind\"]}\n            hosts[host] = entry\n        if action == \"list\":\n            if not hosts:\n                return \"vault is empty\"\n            return \"\\n\".join(\n                f\"{n:<18} id={(rec.get('machine_id') or '-')[:12]} user={rec.get('user')} \"\n                f\"pw={'hashed' if rec.get('pw_sha256') else '-'} aliases={','.join(rec.get('aliases', []))}\"\n                for n, rec in hosts.items()\n            )\n        if entry is None:\n            return f\"no vault entry for '{host}'\"\n        if action == \"show\":\n            return json.dumps({\"name\": host, **entry}, indent=2)\n        if action == \"verify\":\n            if not password:\n                return \"verify needs a password\"\n            return f\"{host}: {'MATCH' if _hash_pw(password, salt) == entry.get('pw_sha256') else 'NO MATCH'}\"\n        if action == \"set\":\n            if not password:\n                return \"set needs a password\"\n            entry[\"pw_sha256\"] = _hash_pw(password, salt)\n            entry[\"enc\"] = _encrypt(password, self.valves.master_passphrase, salt)\n            vault[\"hosts\"][host] = entry\n            self._save_vault(vault)\n            return f\"stored password for {host} (hash + encrypted)\"\n        return f\"unknown action: {action}\"\n\n    def password(self, host: str) -> str:\n        \"\"\"Return the decrypted password for a host from the vault (used for sudo -S and RustDesk).\n\n        :param host: host name or alias\n        \"\"\"\n        vault = self._load_vault()\n        salt = vault[\"salt\"]\n        hosts = vault.get(\"hosts\", {})\n        entry = hosts.get(host)\n        if entry is None:\n            for name, rec in hosts.items():\n                if host in rec.get(\"aliases\", []):\n                    entry, host = rec, name\n                    break\n        if entry is None:\n            return f\"no vault entry for '{host}'\"\n        if not entry.get(\"enc\"):\n            return f\"{host}: no encrypted password stored (only a hash)\"\n        try:\n            return f\"{host}: {_decrypt(entry['enc'], self.valves.master_passphrase, salt)}\"\n        except ValueError as exc:\n            return str(exc)\n\n    # ------------------------------------------------------------- smart resolve\n    def _live_mac(self, ip: str) -> str:\n        \"\"\"MAC currently answering for an address, from the ARP table.\"\"\"\n        try:\n            out = subprocess.run([\"arp\", \"-an\", ip], capture_output=True, text=True, timeout=6).stdout\n            m = re.search(r\"at ([0-9a-f:]{17})\", out)\n            return m.group(1) if m else \"\"\n        except Exception:\n            return \"\"\n\n    def _resolve(self, target: str) -> tuple:\n        \"\"\"Resolve a name, alias, IP, or RustDesk ID.\n\n        Order matters. For an address, first ask who actually owns it right now by matching the\n        live ARP MAC to a vault entry, then fall back to alias lookup. Without this, a DHCP\n        address that changed hands resolves to whichever entry lists it first.\n        \"\"\"\n        key = target.strip().lower()\n        vault = self._load_vault()\n        hosts = vault.get(\"hosts\", {})\n        if re.fullmatch(r\"\\d+\\.\\d+\\.\\d+\\.\\d+\", key):\n            mac = self._live_mac(key)\n            if mac:\n                for name, rec in hosts.items():\n                    if mac in rec.get(\"macs\", {}):\n                        return (key, name, rec)\n        for name, rec in hosts.items():\n            if key == name or key in rec.get(\"aliases\", []):\n                aliases = rec.get(\"aliases\", [])\n                fallback = aliases[1] if len(aliases) > 1 else (aliases[0] if aliases else name)\n                return (rec.get(\"last_seen\") or fallback or name, name, rec)\n        for name, rec in SEED.items():\n            if key == name or key in rec[\"aliases\"]:\n                aliases = rec[\"aliases\"]\n                fallback = aliases[1] if len(aliases) > 1 else aliases[0]\n                return (key if key in aliases else fallback, name, rec)\n        return (target, key, None)\n\n    def _record(self, target: str, machine_id: str) -> str:\n        \"\"\"Smart detection: if an IP turns out to be a machine already known under another\n        name, retag that alias and store it as the last seen address.\"\"\"\n        vault = self._load_vault()\n        hosts = vault.get(\"hosts\", {})\n        entry = None\n        for name, rec in hosts.items():\n            if machine_id and rec.get(\"machine_id\") == machine_id:\n                entry, host_name = rec, name\n                break\n        if entry is None:\n            seed = SEED.get(target)\n            if not seed:\n                return f\"unknown machine id {machine_id}\"\n            entry = {\"machine_id\": seed[\"machine_id\"], \"aliases\": list(seed[\"aliases\"]),\n                     \"user\": seed[\"user\"], \"rustdesk_id\": seed[\"rustdesk_id\"], \"kind\": seed[\"kind\"]}\n            host_name = target\n            hosts[host_name] = entry\n        if target not in entry.get(\"aliases\", []):\n            entry.setdefault(\"aliases\", []).append(target)\n        entry[\"last_seen\"] = target\n        entry[\"seen_at\"] = int(time.time())\n        vault[\"hosts\"][host_name] = entry\n        self._save_vault(vault)\n        return f\"retagged {target} as {host_name} (machine_id {machine_id[:12]}), last seen updated\"\n\n    # --------------------------------------------------------------- ssh core\n    def _ssh(self, host: str, user: str, command: str) -> tuple:\n        key = self._key()\n        base = [\"ssh\", \"-o\", \"BatchMode=yes\", \"-o\", f\"ConnectTimeout={self.valves.connect_timeout}\",\n                \"-o\", \"StrictHostKeyChecking=accept-new\", \"-o\", \"ServerAliveInterval=5\"]\n        if Path(key).is_file():\n            base += [\"-i\", key]\n        base += [f\"{user}@{host}\", command]\n        try:\n            p = subprocess.run(base, capture_output=True, text=True, timeout=self.valves.exec_timeout, errors=\"replace\")\n            return p.returncode, (p.stdout or \"\").strip(), (p.stderr or \"\").strip()\n        except subprocess.TimeoutExpired:\n            return 124, \"\", f\"timed out after {self.valves.exec_timeout}s\"\n        except Exception as exc:\n            return 1, \"\", f\"error: {exc}\"\n\n    def run(self, target: str, command: str, sudo: bool = False, confirm: bool = False) -> str:\n        \"\"\"Run a shell command on a fleet machine over SSH (shared key, no interactive password).\n\n        Smart resolve: names, aliases, Tailscale IPs, LAN IPs, and RustDesk IDs all work.\n        If the address maps to a machine already known under a different name, the vault is\n        retagged and the changed IP is stored as last seen.\n\n        :param target: machine name, alias, IP, or RustDesk ID\n        :param command: shell command\n        :param sudo: run through sudo -S using the vault password (never sudo -n; policy still demands an auth exchange even though any stdin input is accepted)\n        :param confirm: extra round trip to verify machine_id; automatic for unidentified machines, pass True on first contact or when an address may have moved\n        \"\"\"\n        host, name, rec = self._resolve(target)\n        user = (rec or {}).get(\"user\", self.valves.default_user)\n        if sudo:\n            pw = self.password(name).split(\": \", 1)[-1]\n            remote = f\"printf %s\\\\n {shlex.quote(pw)} | sudo -S -p '' {command}\"\n        else:\n            remote = command\n        code, out, err = self._ssh(host, user, remote)\n        # Confirming identity costs a second round trip, so only do it when the entry is still\n        # unidentified or the caller explicitly asks. Use confirm=True on first contact with a\n        # machine, or when you suspect the address has moved.\n        if code == 0 and (confirm or not (rec or {}).get(\"machine_id\")):\n            c2, o2, _ = self._ssh(host, user, \"cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null\")\n            if c2 == 0 and o2:\n                note = self._record(host, o2)\n                if note:\n                    err = (err + \"\\n\" + note).strip()\n        head = f\"[{name} | {host}] exit={code}\"\n        return f\"{head}\\n{out or err or '(no output)'}\"\n\n    def probe(self, target: str) -> str:\n        \"\"\"Try every known address for a machine and report which one answers, then store it.\n\n        Use this when an IP changed and you are not sure which address is live.\n\n        :param target: machine name\n        \"\"\"\n        host, name, rec = self._resolve(target)\n        candidates = list(dict.fromkeys((rec or {}).get(\"aliases\", []) or [target]))\n        results = []\n        for cand in candidates:\n            code, out, err = self._ssh(cand, (rec or {}).get(\"user\", self.valves.default_user),\n                                       \"echo OK; cat /etc/machine-id 2>/dev/null\")\n            if code == 0 and out.startswith(\"OK\"):\n                mid = out.splitlines()[-1]\n                note = self._record(cand, mid)\n                results.append(f\"  {cand}: reachable ({note})\")\n                return \"\\n\".join(results)\n            results.append(f\"  {cand}: no ({err or 'unreachable'})\")\n        return f\"probe {name}\\n\" + \"\\n\".join(results)\n\n    # --------------------------------------------------- persistent tmux sessions\n    def _state(self) -> dict:\n        path = Path(self.valves.vault_dir) / \"sessions.json\"\n        if path.is_file():\n            try:\n                return json.loads(path.read_text(encoding=\"utf-8\"))\n            except Exception:\n                return {}\n        return {}\n\n    def _save_state(self, state: dict) -> None:\n        Path(self.valves.vault_dir).mkdir(parents=True, exist_ok=True)\n        Path(self.valves.vault_dir).joinpath(\"sessions.json\").write_text(json.dumps(state, indent=2), encoding=\"utf-8\")\n\n    def session_open(self, target: str, name: str = \"\") -> str:\n        \"\"\"Open a persistent tmux-backed session on a fleet machine (OpenTerminal style).\n\n        The session survives across tool calls, so long-running processes, logcat, and\n        interactive prompts keep working. Each session is a local tmux window running ssh,\n        with an output cursor stored in sessions.json.\n\n        :param target: machine name or IP\n        :param name: session name (defaults to fleet_<machine>)\n        \"\"\"\n        host, mach, rec = self._resolve(target)\n        if rec and rec.get(\"kind\") == \"android\":\n            sess = name or f\"fleet_{mach}\"\n            subprocess.run([\"tmux\", \"new-session\", \"-d\", \"-s\", sess, f\"adb -s {host}:{self.valves.adb_port} shell\"],\n                           capture_output=True, text=True, timeout=15)\n            return f\"session {sess} -> adb shell on {mach}\"\n        user = (rec or {}).get(\"user\", self.valves.default_user)\n        key = self.valves.ssh_key\n        keyflag = f\" -i {key}\" if Path(key).is_file() else \"\"\n        sess = name or f\"fleet_{mach}\"\n        state = self._state()\n        if sess not in state:\n            subprocess.run([\"tmux\", \"new-session\", \"-d\", \"-s\", sess,\n                            f\"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new{keyflag} {user}@{host}\"],\n                           capture_output=True, text=True, timeout=15)\n            state[sess] = {\"machine\": mach, \"host\": host, \"offset\": 0, \"created\": int(time.time())}\n            self._save_state(state)\n        return f\"session {sess} -> {mach} ({host})\"\n\n    def session_send(self, session: str, command: str) -> str:\n        \"\"\"Send a command into an open tmux session.\n\n        :param session: session name from session_open\n        :param command: command to send to that session's shell (or its foreground program)\n        \"\"\"\n        subprocess.run([\"tmux\", \"send-keys\", \"-t\", session, command, \"Enter\"], timeout=10)\n        return f\"sent to {session}: {command}\"\n\n    def session_read(self, session: str, tail: int = 40) -> str:\n        \"\"\"Read new output from a tmux session, starting at the stored cursor.\n\n        :param session: session name from session_open\n        :param tail: maximum lines to return\n        \"\"\"\n        state = self._state()\n        rec = state.get(session, {})\n        out = subprocess.run([\"tmux\", \"capture-pane\", \"-t\", session, \"-p\", \"-S\", \"-2000\"],\n                             capture_output=True, text=True, timeout=10).stdout\n        # capture-pane pads the pane with trailing blank lines, so trim them before\n        # comparing against the stored cursor, otherwise the offset runs past real content.\n        lines = out.splitlines()\n        while lines and not lines[-1].strip():\n            lines.pop()\n        offset = rec.get(\"offset\", 0)\n        new = [ln for ln in lines[offset:offset + tail] if ln.strip()]\n        if rec:\n            rec[\"offset\"] = len(lines)\n            self._save_state(state)\n        return (f\"[{session}] {len(new)} new lines\\n\" + \"\\n\".join(new)) if new else f\"[{session}] no new output\"\n\n    def sessions(self) -> str:\n        \"\"\"List open tmux sessions and their cursors.\"\"\"\n        state = self._state()\n        if not state:\n            return \"no open sessions\"\n        live = subprocess.run([\"tmux\", \"ls\"], capture_output=True, text=True, timeout=10).stdout\n        lines = []\n        for sess, rec in state.items():\n            lines.append(f\"{sess:<24} machine={rec.get('machine')} host={rec.get('host')} \"\n                         f\"offset={rec.get('offset')} live={'yes' if sess in live else 'no'}\")\n        return \"\\n\".join(lines)\n\n    # ---------------------------------------------------------------- adb\n    def adb(self, action: str, device: str = \"\", command: str = \"\", port: int = 0, local: str = \"\", remote: str = \"\") -> str:\n        \"\"\"Wireless ADB for Android devices on the fleet.\n\n        Typical flow: adb(action='connect', device='10.0.0.20', port=5555), then\n        adb(action='shell', device='10.0.0.20:5555', command='getprop ro.product.model').\n        Common actions: connect, disconnect, devices, shell, logcat, install, push, pull,\n        screencap, reboot, root, battery, wifi, props.\n\n        :param action: what to do\n        :param device: ip (connect) or serial like 10.0.0.20:5555 (other actions)\n        :param command: shell command for 'shell', filter for 'logcat'\n        :param port: tcp port for connect (default 5555)\n        :param local: local path for push/pull\n        :param remote: remote path for push/pull\n        \"\"\"\n        port = port or self.valves.adb_port\n        base = [\"adb\"]\n        if device and action != \"connect\" and action != \"devices\":\n            base += [\"-s\", device if \":\" in device else f\"{device}:{port}\"]\n        if action == \"connect\":\n            target = device if \":\" in device else f\"{device}:{port}\"\n            p = subprocess.run(base + [\"connect\", target], capture_output=True, text=True, timeout=15, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action == \"disconnect\":\n            target = device if \":\" in device else f\"{device}:{port}\"\n            p = subprocess.run([\"adb\", \"disconnect\", target], capture_output=True, text=True, timeout=15, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action == \"devices\":\n            p = subprocess.run(base + [\"devices\", \"-l\"], capture_output=True, text=True, timeout=15, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action in (\"shell\", \"logcat\"):\n            p = subprocess.run(base + [action, command or (\"\" if action == \"shell\" else \"-d -v event\")],\n                               capture_output=True, text=True, timeout=self.valves.exec_timeout, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action == \"install\":\n            p = subprocess.run(base + [\"install\", \"-r\", command], capture_output=True, text=True, timeout=60, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action in (\"push\", \"pull\"):\n            p = subprocess.run(base + [action, local, remote], capture_output=True, text=True, timeout=60, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        if action in (\"screencap\", \"reboot\", \"root\", \"battery\", \"wifi\", \"props\"):\n            if action == \"props\":\n                cmd = \"getprop\"\n            elif action == \"battery\":\n                cmd = \"dumpsys battery\"\n            elif action == \"wifi\":\n                cmd = \"dumpsys wifi | head -40\"\n            elif action == \"screencap\":\n                return f\"run: adb -s {device}:{port} exec-out screencap -p > {local or '/tmp/shot.png'}\"\n            else:\n                cmd = action\n            p = subprocess.run(base + [\"shell\", cmd], capture_output=True, text=True, timeout=self.valves.exec_timeout, errors=\"replace\")\n            return p.stdout.strip() or p.stderr.strip()\n        return f\"unknown adb action: {action}\"\n\n    # ------------------------------------------------------------- rustdesk\n    def rustdesk(self, target: str, launch: bool = False) -> str:\n        \"\"\"RustDesk peer info and optional GUI session launch.\n\n        The installed build is the Flutter UI binary on every machine, so it cannot be\n        scripted for headless control. Use run() for commands. This reports the peer record\n        and can open the interactive window using the vault password.\n\n        :param target: machine name or IP\n        :param launch: open the session window (needs a display)\n        \"\"\"\n        host, name, rec = self._resolve(target)\n        rid = (rec or {}).get(\"rustdesk_id\", \"\")\n        if not rid:\n            return f\"no RustDesk id for {name}\"\n        pw = self.password(name).split(\": \", 1)[-1]\n        info = f\"rustdesk id={rid} name={name}\"\n        if not launch:\n            return info + \"\\n(UI-only build: no scripted execution; use run() for commands)\"\n        if not os.environ.get(\"DISPLAY\") and not os.environ.get(\"WAYLAND_DISPLAY\"):\n            return info + \"\\ncannot launch: no display in this process environment\"\n        subprocess.run([\"xdg-open\", f\"rustdesk://{rid}?password={pw}\"], capture_output=True, text=True, timeout=10)\n        return f\"{info}\\nsession window opening for {name}\"\n\n    def fleet(self) -> str:\n        \"\"\"List every machine in the vault/seed catalog: identity, aliases, user, kind.\"\"\"\n        vault = self._load_vault()\n        hosts = vault.get(\"hosts\", {}) or {n: dict(r, aliases=list(r[\"aliases\"])) for n, r in SEED.items()}\n        lines = []\n        for name, rec in hosts.items():\n            lines.append(f\"{name:<20} {(rec.get('machine_id') or '-')[:12]} {rec.get('kind', 'linux'):<8} \"\n                         f\"user={str(rec.get('user')):<20} last={rec.get('last_seen', '-'):<15} aliases={','.join(rec.get('aliases', []))}\")\n        return \"\\n\".join(lines) if lines else \"no machines\"\n\n    def ingest(self) -> str:\n        \"\"\"Import RustDesk's peer database into the vault as identity anchors.\n\n        RustDesk stores ip -> mac per peer. MAC is a better identity anchor than IP because\n        it survives address changes, so the scan can retag a new address onto the right machine.\n        \"\"\"\n        path = Path(os.path.expanduser(\"~/.config/rustdesk/RustDesk_lan_peers.toml\"))\n        if not path.is_file():\n            return \"rustdesk peer database not found\"\n        vault = self._load_vault()\n        hosts = vault.setdefault(\"hosts\", {})\n        added = []\n        text = path.read_text(encoding=\"utf-8\", errors=\"replace\")\n        # The file starts with [[peers]] at line 1, so the first block has no leading newline.\n        # Splitting on '\\n[[peers]]\\n' and slicing [1:] would drop it, so split on the bare marker.\n        for block in re.split(r\"\\[\\[peers\\]\\]\\n\", text)[1:]:\n            name = re.search(r\"hostname = '([^']*)'\", block)\n            rid = re.search(r\"id = '([^']*)'\", block)\n            pairs = re.findall(r'\"([\\d.]+)\" = \\'([0-9a-f:]{17})\\'', block)\n            if not pairs:\n                continue\n            host = (name.group(1) if name else \"\") or rid.group(1)\n            rec = hosts.setdefault(host, {\"machine_id\": \"\", \"aliases\": [host], \"user\": self.valves.default_user,\n                                          \"rustdesk_id\": rid.group(1) if rid else \"\", \"kind\": \"linux\"})\n            for ip, mac in pairs:\n                rec.setdefault(\"macs\", {})[mac] = ip\n                if ip not in rec.get(\"aliases\", []):\n                    rec.setdefault(\"aliases\", []).append(ip)\n            added.append(f\"{host}: {len(pairs)} address(es), macs={list(rec['macs'])}\")\n        vault[\"hosts\"] = hosts\n        self._save_vault(vault)\n        return \"ingest\\n\" + \"\\n\".join(added)\n\n    def scan(self) -> str:\n        \"\"\"Re-discover addresses for every machine in the catalog.\n\n        Reads tailscale status for current peer IPs and the local ARP table for LAN IPs, then\n        merges anything new into the vault aliases. Machine identity comes from machine_id, so\n        an address that moved onto a machine already known under another name gets retagged.\n        Use this after a lease change or when a machine shows up on a new address.\n        \"\"\"\n        vault = self._load_vault()\n        hosts = vault.get(\"hosts\", {}) or {n: dict(r, aliases=list(r[\"aliases\"])) for n, r in SEED.items()}\n        lines = []\n        try:\n            ts = subprocess.run([\"tailscale\", \"status\", \"--peers=true\"], capture_output=True, text=True, timeout=10).stdout\n        except Exception as exc:\n            ts = \"\"\n            lines.append(f\"tailscale unavailable: {exc}\")\n        for row in ts.splitlines():\n            parts = row.split()\n            if len(parts) < 3:\n                continue\n            ip, name = parts[0], parts[1].lower()\n            if name in hosts:\n                rec = hosts[name]\n                if ip not in rec.get(\"aliases\", []):\n                    rec.setdefault(\"aliases\", []).append(ip)\n                    lines.append(f\"added {ip} to {name}\")\n                rec[\"last_seen\"] = ip\n                rec[\"state\"] = \" \".join(parts[3:]) or \"active\"\n        try:\n            arp = subprocess.run([\"arp\", \"-an\"], capture_output=True, text=True, timeout=10).stdout\n        except Exception:\n            arp = \"\"\n        for ip, mac in re.findall(r\"\\((\\d+\\.\\d+\\.\\d+\\.\\d+)\\) at ([0-9a-f:]{17})\", arp):\n            matched = None\n            for name, rec in hosts.items():\n                if mac in rec.get(\"macs\", {}):\n                    matched = name\n                    break\n            if matched:\n                rec = hosts[matched]\n                if ip not in rec.get(\"aliases\", []):\n                    rec.setdefault(\"aliases\", []).append(ip)\n                    lines.append(f\"arp: {ip} -> {matched} (same mac)\")\n                rec[\"last_seen\"] = ip\n            else:\n                lines.append(f\"arp: {ip} ({mac}) not in catalog\")\n        vault[\"hosts\"] = hosts\n        self._save_vault(vault)\n        return \"scan\\n\" + (\"\\n\".join(lines) if lines else \"no changes found\")\n\n    def check(self, target: str) -> str:\n        \"\"\"Test a machine: which address answers, key auth, OS, sudo state, vault entry.\n\n        :param target: machine name or IP\n        \"\"\"\n        host, name, rec = self._resolve(target)\n        user = (rec or {}).get(\"user\", self.valves.default_user)\n        t0 = time.time()\n        code, out, err = self._ssh(host, user,\n                                   \"hostname; uname -r; head -1 /etc/os-release 2>/dev/null; cat /etc/machine-id 2>/dev/null; \"\n                                   \"printf '\\\\n' | sudo -S -p '' id >/dev/null 2>&1 && echo 'sudo: stdin auth accepted' || echo 'sudo: rejected'\")\n        dt = round(time.time() - t0, 2)\n        if code == 0:\n            mid = re.search(r\"^[0-9a-f]{32}$\", out, re.M)\n            if mid:\n                self._record(host, mid.group(0))\n            return f\"[{name} | {host}] reachable in {dt}s\\n{out}\"\n        return f\"[{name} | {host}] unreachable exit={code} in {dt}s\\n{err}\"\n",
+    "specs": [
+      {
+        "name": "adb",
+        "description": "Wireless ADB for Android devices on the fleet.\n\nTypical flow: adb(action='connect', device='10.0.0.20', port=5555), then\nadb(action='shell', device='10.0.0.20:5555', command='getprop ro.product.model').\nCommon actions: connect, disconnect, devices, shell, logcat, install, push, pull,\nscreencap, reboot, root, battery, wifi, props.",
+        "parameters": {
+          "properties": {
+            "action": {
+              "description": "what to do",
+              "type": "string"
+            },
+            "device": {
+              "default": "",
+              "type": "string",
+              "description": "ip (connect) or serial like 10.0.0.20:5555 (other actions)"
+            },
+            "command": {
+              "default": "",
+              "type": "string",
+              "description": "shell command for 'shell', filter for 'logcat'"
+            },
+            "port": {
+              "default": 0,
+              "type": "integer",
+              "description": "tcp port for connect (default 5555)"
+            },
+            "local": {
+              "default": "",
+              "type": "string",
+              "description": "local path for push/pull"
+            },
+            "remote": {
+              "default": "",
+              "type": "string",
+              "description": "remote path for push/pull"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "check",
+        "description": "Test a machine: which address answers, key auth, OS, sudo state, vault entry.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "fleet",
+        "description": "List every machine in the vault/seed catalog: identity, aliases, user, kind.",
+        "parameters": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        }
+      },
+      {
+        "name": "ingest",
+        "description": "Import RustDesk's peer database into the vault as identity anchors.\n\nRustDesk stores ip -> mac per peer. MAC is a better identity anchor than IP because\nit survives address changes, so the scan can retag a new address onto the right machine.",
+        "parameters": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        }
+      },
+      {
+        "name": "password",
+        "description": "Return the decrypted password for a host from the vault (used for sudo -S and RustDesk).",
+        "parameters": {
+          "properties": {
+            "host": {
+              "description": "host name or alias",
+              "type": "string"
+            }
+          },
+          "required": [
+            "host"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "probe",
+        "description": "Try every known address for a machine and report which one answers, then store it.\n\nUse this when an IP changed and you are not sure which address is live.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "run",
+        "description": "Run a shell command on a fleet machine over SSH (shared key, no interactive password).\n\nSmart resolve: names, aliases, Tailscale IPs, LAN IPs, and RustDesk IDs all work.\nIf the address maps to a machine already known under a different name, the vault is\nretagged and the changed IP is stored as last seen.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name, alias, IP, or RustDesk ID",
+              "type": "string"
+            },
+            "command": {
+              "description": "shell command",
+              "type": "string"
+            },
+            "sudo": {
+              "default": false,
+              "type": "boolean",
+              "description": "run through sudo -S using the vault password (never sudo -n; policy still demands an auth exchange even though any stdin input is accepted)"
+            },
+            "confirm": {
+              "default": false,
+              "type": "boolean",
+              "description": "extra round trip to verify machine_id; automatic for unidentified machines, pass True on first contact or when an address may have moved"
+            }
+          },
+          "required": [
+            "target",
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "rustdesk",
+        "description": "RustDesk peer info and optional GUI session launch.\n\nThe installed build is the Flutter UI binary on every machine, so it cannot be\nscripted for headless control. Use run() for commands. This reports the peer record\nand can open the interactive window using the vault password.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "launch": {
+              "default": false,
+              "type": "boolean",
+              "description": "open the session window (needs a display)"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "scan",
+        "description": "Re-discover addresses for every machine in the catalog.\n\nReads tailscale status for current peer IPs and the local ARP table for LAN IPs, then\nmerges anything new into the vault aliases. Machine identity comes from machine_id, so\nan address that moved onto a machine already known under another name gets retagged.\nUse this after a lease change or when a machine shows up on a new address.",
+        "parameters": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        }
+      },
+      {
+        "name": "session_open",
+        "description": "Open a persistent tmux-backed session on a fleet machine (OpenTerminal style).\n\nThe session survives across tool calls, so long-running processes, logcat, and\ninteractive prompts keep working. Each session is a local tmux window running ssh,\nwith an output cursor stored in sessions.json.",
+        "parameters": {
+          "properties": {
+            "target": {
+              "description": "machine name or IP",
+              "type": "string"
+            },
+            "name": {
+              "default": "",
+              "type": "string",
+              "description": "session name (defaults to fleet_<machine>)"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "session_read",
+        "description": "Read new output from a tmux session, starting at the stored cursor.",
+        "parameters": {
+          "properties": {
+            "session": {
+              "description": "session name from session_open",
+              "type": "string"
+            },
+            "tail": {
+              "default": 40,
+              "type": "integer",
+              "description": "maximum lines to return"
+            }
+          },
+          "required": [
+            "session"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "session_send",
+        "description": "Send a command into an open tmux session.",
+        "parameters": {
+          "properties": {
+            "session": {
+              "description": "session name from session_open",
+              "type": "string"
+            },
+            "command": {
+              "description": "command to send to that session's shell (or its foreground program)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "session",
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "sessions",
+        "description": "List open tmux sessions and their cursors.",
+        "parameters": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        }
+      },
+      {
+        "name": "vault",
+        "description": "Read or update the credential vault.\n\nEach host stores: machine_id (stable identity), aliases (names + IPs), ssh user,\nRustDesk ID, the password hash for verification, and the encrypted password.\nThe file is portable, so the same vault works on any machine as long as the\nmaster passphrase matches. Lookup order is local vault first, then the backup copy.",
+        "parameters": {
+          "properties": {
+            "action": {
+              "default": "list",
+              "type": "string",
+              "description": "list, show, verify, set, or where"
+            },
+            "host": {
+              "default": "",
+              "type": "string",
+              "description": "host name or alias"
+            },
+            "password": {
+              "default": "",
+              "type": "string",
+              "description": "password to verify or store"
+            }
+          },
+          "required": [],
+          "type": "object"
+        }
+      }
+    ]
+  }
+]
