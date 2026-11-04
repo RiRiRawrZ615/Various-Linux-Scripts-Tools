@@ -23,11 +23,11 @@ own user's permissions. Read a tool's source before importing it.
 | `tool-custom_leanrea_reverse_v2-export.json` | leanrea Reverse Engineer | Per-project reverse engineering harness: routes a target by magic bytes, runs the real RE CLIs, and keeps durable state on disk. |
 | `tool-fleet_ops-export.json` | Fleet Ops | Fleet control over SSH with tmux sessions, wireless ADB, and an encrypted per-host credential vault. |
 | `tool-fleet_ssh-export.json` | Fleet SSH + RustDesk | Smaller sibling of Fleet Ops: SSH commands, file push/pull, connectivity checks, RustDesk peer lookup. |
-| `tool-custom_duckduckgo_search_30-export.json` | Web Search | Public web search, single-URL extraction, and bounded multi-source research. |
+| `tool-custom_duckduckgo_search_30-export-1793741845880.json` | Web Search | Public web search, single-URL extraction, and bounded multi-source research. |
 | `tool-custom_social_reddit_x_1-export.json` | Reddit + X Reader | Keyless Reddit and X readers: listings, threads with comment trees, profiles, and search. |
-| `tool-custom_youtube_visual_1-export.json` | YouTube Visual Reader | Captions plus an optional time-coded visual pass over storyboard frames. |
+| `tool-custom_youtube_visual_1-export-1793741840426.json` | YouTube Visual Reader | Captions plus an optional time-coded visual pass over storyboard frames. |
 | `tool-youtube_video_parser-export-1793741843741.json` | YouTube Video Parser | Captions or transcript for a YouTube URL, falling back to public metadata. |
-| `tool-universal_cognitive_memory_vault-export.json` | Universal Cognitive Memory Vault | Facade over Open WebUI's native Memory, kept in sync with the built-in memory tools. |
+| `tool-universal_cognitive_memory_vault-export-1793741847794.json` | Universal Cognitive Memory Vault | Facade over Open WebUI's native Memory, kept in sync with the built-in memory tools. |
 | `tool-pcalc-export-1793741854738.json` | Calculator | Safe expression evaluation for agents, no `eval()`, plus linear and quadratic solving. |
 
 ### leanrea Reverse Engineer
