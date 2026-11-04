@@ -26,7 +26,7 @@ own user's permissions. Read a tool's source before importing it.
 | `tool-custom_duckduckgo_search_30-export.json` | Web Search | Public web search, single-URL extraction, and bounded multi-source research. |
 | `tool-custom_social_reddit_x_1-export.json` | Reddit + X Reader | Keyless Reddit and X readers: listings, threads with comment trees, profiles, and search. |
 | `tool-custom_youtube_visual_1-export.json` | YouTube Visual Reader | Captions plus an optional time-coded visual pass over storyboard frames. |
-| `tool-youtube_video_parser-export.json` | YouTube Video Parser | Captions or transcript for a YouTube URL, falling back to public metadata. |
+| `tool-youtube_video_parser-export-1793741843741.json` | YouTube Video Parser | Captions or transcript for a YouTube URL, falling back to public metadata. |
 | `tool-universal_cognitive_memory_vault-export.json` | Universal Cognitive Memory Vault | Facade over Open WebUI's native Memory, kept in sync with the built-in memory tools. |
 | `tool-pcalc-export-1793741854738.json` | Calculator | Safe expression evaluation for agents, no `eval()`, plus linear and quadratic solving. |
 
