@@ -1,1 +1,155 @@
-[{"version_id":"60b03af3-9819-4bfc-85cb-fde0c6f17301","id":"universal_cognitive_memory_vault","user_id":"5597da5a-f064-4410-aa40-4df206e04ffb","name":"Universal Cognitive Memory Vault","meta":{"i18n":null,"description":"Native Open WebUI Memory vault for durable cross-chat context. Long-form knowledge belongs in Open WebUI Knowledge Bases; no separate chapter ingestion or disk JSON RAG database.","manifest":{"title":"Universal Cognitive Memory Vault","author":"Low-Level Storage Engineering","version":"10.1.0","description":"Native Open WebUI Memory helper. Uses Open WebUI's persistent Memory system for durable context. Long-form material belongs in Knowledge Bases, including native kb_exec when ENABLE_KB_EXEC=True."},"has_user_valves":false},"is_active":true,"access_grants":[],"updated_at":1790024280,"created_at":1790024280,"user":null,"write_access":true,"content":"\"\"\"\ntitle: Universal Cognitive Memory Vault\nauthor: Low-Level Storage Engineering\nversion: 10.1.0\ndescription: Native Open WebUI Memory helper. Uses Open WebUI's persistent Memory system for durable context. Long-form material belongs in Knowledge Bases, including native kb_exec when ENABLE_KB_EXEC=True.\n\"\"\"\n\nfrom typing import Any, Callable, Awaitable, Optional\n\n\nclass Tools:\n    \"\"\"Durable-memory facade over Open WebUI's native built-in Memory functions.\"\"\"\n\n    @staticmethod\n    async def _emit(\n        emitter: Optional[Callable[[dict[str, Any]], Awaitable[None]]],\n        description: str,\n        done: bool,\n    ) -> None:\n        if not callable(emitter):\n            return\n        try:\n            await emitter({\"type\": \"status\", \"data\": {\"description\": description, \"done\": done}})\n        except Exception:\n            pass\n\n    @staticmethod\n    def _memory_tools():\n        # These are the same native functions Open WebUI exposes as built-in Memory tools.\n        from open_webui.tools.builtin import (\n            add_memory,\n            list_memory_paths,\n            read_memory_path,\n            search_memories,\n            update_memory,\n        )\n        return add_memory, search_memories, list_memory_paths, read_memory_path, update_memory\n\n    async def remember(\n        self,\n        content: str,\n        type: str = \"user\",\n        path: str = \"\",\n        __request__: Any = None,\n        __user__: dict = None,\n        __event_emitter__: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,\n    ) -> str:\n        \"\"\"\n        Save durable information using Open WebUI's native Memory system.\n        Use user for stable facts/preferences/instructions about the user and context for durable project context.\n        Use path to group related memories. Do not put long documents or chapters here.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not (content or \"\").strip():\n            return \"[MEMORY ERROR] Content is empty.\"\n        if type not in {\"user\", \"context\"}:\n            type = \"user\"\n        await self._emit(__event_emitter__, \"Saving durable memory…\", False)\n        try:\n            add_memory, _, _, _, _ = self._memory_tools()\n            result = await add_memory(\n                content=content.strip(),\n                type=type,\n                path=path.strip() or None,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n            await self._emit(__event_emitter__, \"Memory saved.\", True)\n            return result\n        except Exception as exc:\n            await self._emit(__event_emitter__, \"Memory save failed.\", True)\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def recall(\n        self,\n        query: str = \"\",\n        count: int = 8,\n        type: str = \"all\",\n        path: str = \"\",\n        memory_id: str = \"\",\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"\n        Search Open WebUI's native persistent Memory by meaning, content, path, or exact memory ID.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        try:\n            _, search_memories, _, _, _ = self._memory_tools()\n            return await search_memories(\n                query=query or \"\",\n                count=max(1, min(int(count), 50)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                path=path.strip() or None,\n                memory_id=memory_id.strip() or None,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def list_paths(\n        self,\n        query: str = \"\",\n        count: int = 100,\n        type: str = \"all\",\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"List native Open WebUI Memory path groups.\"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        try:\n            _, _, list_memory_paths, _, _ = self._memory_tools()\n            return await list_memory_paths(\n                query=query or \"\",\n                count=max(1, min(int(count), 500)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def read_path(\n        self,\n        path: str,\n        count: int = 50,\n        type: str = \"all\",\n        include_children: bool = True,\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"Read native Memory entries at a path, optionally including child paths.\"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not path.strip():\n            return \"[MEMORY ERROR] A memory path is required.\"\n        try:\n            _, _, _, read_memory_path, _ = self._memory_tools()\n            return await read_memory_path(\n                path=path.strip(),\n                count=max(1, min(int(count), 100)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                include_children=bool(include_children),\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def update_memories(\n        self,\n        operations: list[dict],\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"\n        Apply native Memory add/replace/move/remove operations in one request.\n        Prefer replace/move/remove when changing an existing memory to avoid duplicates.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not isinstance(operations, list) or not operations:\n            return \"[MEMORY ERROR] operations must be a non-empty array.\"\n        try:\n            _, _, _, _, update_memory = self._memory_tools()\n            return await update_memory(\n                operations=operations,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def knowledge_guidance(self) -> str:\n        \"\"\"\n        Explain the intended division of labor with native Knowledge Bases.\n        This function does not duplicate kb_exec; Open WebUI injects kb_exec natively when enabled.\n        \"\"\"\n        return (\n            \"Memory: durable facts, preferences, standing instructions, goals, and project context. \"\n            \"Knowledge Base: long-form source material and documents. \"\n            \"For attached Knowledge Bases, use Open WebUI's native query_knowledge_files for semantic retrieval. \"\n            \"When ENABLE_KB_EXEC=True, Open WebUI also exposes native kb_exec for exact filesystem-style work: \"\n            \"ls, tree, cat, head, tail, grep, find, wc, stat, sed, and pipelines. \"\n            \"Do not create a second disk-backed JSON RAG database or ingest chapters into this tool.\"\n        )\n","specs":[{"name":"knowledge_guidance","description":"Explain the intended division of labor with native Knowledge Bases.\nThis function does not duplicate kb_exec; Open WebUI injects kb_exec natively when enabled.","parameters":{"properties":{},"type":"object"}},{"name":"list_paths","description":"List native Open WebUI Memory path groups.","parameters":{"properties":{"query":{"default":"","type":"string"},"count":{"default":100,"type":"integer"},"type":{"default":"all","type":"string"}},"type":"object"}},{"name":"read_path","description":"Read native Memory entries at a path, optionally including child paths.","parameters":{"properties":{"path":{"type":"string"},"count":{"default":50,"type":"integer"},"type":{"default":"all","type":"string"},"include_children":{"default":true,"type":"boolean"}},"required":["path"],"type":"object"}},{"name":"recall","description":"Search Open WebUI's native persistent Memory by meaning, content, path, or exact memory ID.","parameters":{"properties":{"query":{"default":"","type":"string"},"count":{"default":8,"type":"integer"},"type":{"default":"all","type":"string"},"path":{"default":"","type":"string"},"memory_id":{"default":"","type":"string"}},"type":"object"}},{"name":"remember","description":"Save durable information using Open WebUI's native Memory system.\nUse user for stable facts/preferences/instructions about the user and context for durable project context.\nUse path to group related memories. Do not put long documents or chapters here.","parameters":{"properties":{"content":{"type":"string"},"type":{"default":"user","type":"string"},"path":{"default":"","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_memories","description":"Apply native Memory add/replace/move/remove operations in one request.\nPrefer replace/move/remove when changing an existing memory to avoid duplicates.","parameters":{"properties":{"operations":{"items":{"additionalProperties":true,"type":"object"},"type":"array"}},"required":["operations"],"type":"object"}}]}]
+[
+  {
+    "version_id": "60b03af3-9819-4bfc-85cb-fde0c6f17301",
+    "id": "universal_cognitive_memory_vault",
+    "user_id": "5597da5a-f064-4410-aa40-4df206e04ffb",
+    "name": "Universal Cognitive Memory Vault",
+    "meta": {
+      "i18n": null,
+      "description": "Facade over Open WebUI's native Memory for durable cross-chat context: add, search, list paths, read a path, replace, delete. Long-form knowledge belongs in Knowledge Bases, not here. Works only as a workspace tool because it imports the native functions from the Open WebUI package.",
+      "manifest": {
+        "title": "Universal Cognitive Memory Vault",
+        "author": "Low-Level Storage Engineering",
+        "version": "10.1.0",
+        "description": "Native Open WebUI Memory helper. Uses Open WebUI's persistent Memory system for durable context. Long-form material belongs in Knowledge Bases, including native kb_exec when ENABLE_KB_EXEC=True."
+      },
+      "has_user_valves": false
+    },
+    "is_active": true,
+    "access_grants": [],
+    "updated_at": 1790024280,
+    "created_at": 1790024280,
+    "user": null,
+    "write_access": true,
+    "content": "\"\"\"\ntitle: Universal Cognitive Memory Vault\nauthor: Low-Level Storage Engineering\nversion: 10.1.0\ndescription: Native Open WebUI Memory helper. Uses Open WebUI's persistent Memory system for durable context. Long-form material belongs in Knowledge Bases, including native kb_exec when ENABLE_KB_EXEC=True.\n\"\"\"\n\nfrom typing import Any, Callable, Awaitable, Optional\n\n\nclass Tools:\n    \"\"\"Durable-memory facade over Open WebUI's native built-in Memory functions.\"\"\"\n\n    @staticmethod\n    async def _emit(\n        emitter: Optional[Callable[[dict[str, Any]], Awaitable[None]]],\n        description: str,\n        done: bool,\n    ) -> None:\n        if not callable(emitter):\n            return\n        try:\n            await emitter({\"type\": \"status\", \"data\": {\"description\": description, \"done\": done}})\n        except Exception:\n            pass\n\n    @staticmethod\n    def _memory_tools():\n        # These are the same native functions Open WebUI exposes as built-in Memory tools.\n        from open_webui.tools.builtin import (\n            add_memory,\n            list_memory_paths,\n            read_memory_path,\n            search_memories,\n            update_memory,\n        )\n        return add_memory, search_memories, list_memory_paths, read_memory_path, update_memory\n\n    async def remember(\n        self,\n        content: str,\n        type: str = \"user\",\n        path: str = \"\",\n        __request__: Any = None,\n        __user__: dict = None,\n        __event_emitter__: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,\n    ) -> str:\n        \"\"\"\n        Save durable information using Open WebUI's native Memory system.\n        Use user for stable facts/preferences/instructions about the user and context for durable project context.\n        Use path to group related memories. Do not put long documents or chapters here.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not (content or \"\").strip():\n            return \"[MEMORY ERROR] Content is empty.\"\n        if type not in {\"user\", \"context\"}:\n            type = \"user\"\n        await self._emit(__event_emitter__, \"Saving durable memory\u2026\", False)\n        try:\n            add_memory, _, _, _, _ = self._memory_tools()\n            result = await add_memory(\n                content=content.strip(),\n                type=type,\n                path=path.strip() or None,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n            await self._emit(__event_emitter__, \"Memory saved.\", True)\n            return result\n        except Exception as exc:\n            await self._emit(__event_emitter__, \"Memory save failed.\", True)\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def recall(\n        self,\n        query: str = \"\",\n        count: int = 8,\n        type: str = \"all\",\n        path: str = \"\",\n        memory_id: str = \"\",\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"\n        Search Open WebUI's native persistent Memory by meaning, content, path, or exact memory ID.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        try:\n            _, search_memories, _, _, _ = self._memory_tools()\n            return await search_memories(\n                query=query or \"\",\n                count=max(1, min(int(count), 50)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                path=path.strip() or None,\n                memory_id=memory_id.strip() or None,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def list_paths(\n        self,\n        query: str = \"\",\n        count: int = 100,\n        type: str = \"all\",\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"List native Open WebUI Memory path groups.\"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        try:\n            _, _, list_memory_paths, _, _ = self._memory_tools()\n            return await list_memory_paths(\n                query=query or \"\",\n                count=max(1, min(int(count), 500)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def read_path(\n        self,\n        path: str,\n        count: int = 50,\n        type: str = \"all\",\n        include_children: bool = True,\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"Read native Memory entries at a path, optionally including child paths.\"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not path.strip():\n            return \"[MEMORY ERROR] A memory path is required.\"\n        try:\n            _, _, _, read_memory_path, _ = self._memory_tools()\n            return await read_memory_path(\n                path=path.strip(),\n                count=max(1, min(int(count), 100)),\n                type=type if type in {\"user\", \"context\", \"all\"} else \"all\",\n                include_children=bool(include_children),\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def update_memories(\n        self,\n        operations: list[dict],\n        __request__: Any = None,\n        __user__: dict = None,\n    ) -> str:\n        \"\"\"\n        Apply native Memory add/replace/move/remove operations in one request.\n        Prefer replace/move/remove when changing an existing memory to avoid duplicates.\n        \"\"\"\n        if __request__ is None:\n            return \"[MEMORY ERROR] Open WebUI request context is unavailable.\"\n        if not isinstance(operations, list) or not operations:\n            return \"[MEMORY ERROR] operations must be a non-empty array.\"\n        try:\n            _, _, _, _, update_memory = self._memory_tools()\n            return await update_memory(\n                operations=operations,\n                __request__=__request__,\n                __user__=__user__ or {},\n            )\n        except Exception as exc:\n            return f\"[MEMORY ERROR] {exc}\"\n\n    async def knowledge_guidance(self) -> str:\n        \"\"\"\n        Explain the intended division of labor with native Knowledge Bases.\n        This function does not duplicate kb_exec; Open WebUI injects kb_exec natively when enabled.\n        \"\"\"\n        return (\n            \"Memory: durable facts, preferences, standing instructions, goals, and project context. \"\n            \"Knowledge Base: long-form source material and documents. \"\n            \"For attached Knowledge Bases, use Open WebUI's native query_knowledge_files for semantic retrieval. \"\n            \"When ENABLE_KB_EXEC=True, Open WebUI also exposes native kb_exec for exact filesystem-style work: \"\n            \"ls, tree, cat, head, tail, grep, find, wc, stat, sed, and pipelines. \"\n            \"Do not create a second disk-backed JSON RAG database or ingest chapters into this tool.\"\n        )\n",
+    "specs": [
+      {
+        "name": "knowledge_guidance",
+        "description": "Explain the intended division of labor with native Knowledge Bases.\nThis function does not duplicate kb_exec; Open WebUI injects kb_exec natively when enabled.",
+        "parameters": {
+          "properties": {},
+          "type": "object"
+        }
+      },
+      {
+        "name": "list_paths",
+        "description": "List native Open WebUI Memory path groups.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "default": "",
+              "type": "string"
+            },
+            "count": {
+              "default": 100,
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      {
+        "name": "read_path",
+        "description": "Read native Memory entries at a path, optionally including child paths.",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "count": {
+              "default": 50,
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "type": "string"
+            },
+            "include_children": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "recall",
+        "description": "Search Open WebUI's native persistent Memory by meaning, content, path, or exact memory ID.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "default": "",
+              "type": "string"
+            },
+            "count": {
+              "default": 8,
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "type": "string"
+            },
+            "path": {
+              "default": "",
+              "type": "string"
+            },
+            "memory_id": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      {
+        "name": "remember",
+        "description": "Save durable information using Open WebUI's native Memory system.\nUse user for stable facts/preferences/instructions about the user and context for durable project context.\nUse path to group related memories. Do not put long documents or chapters here.",
+        "parameters": {
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "type": {
+              "default": "user",
+              "type": "string"
+            },
+            "path": {
+              "default": "",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "type": "object"
+        }
+      },
+      {
+        "name": "update_memories",
+        "description": "Apply native Memory add/replace/move/remove operations in one request.\nPrefer replace/move/remove when changing an existing memory to avoid duplicates.",
+        "parameters": {
+          "properties": {
+            "operations": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "operations"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  }
+]

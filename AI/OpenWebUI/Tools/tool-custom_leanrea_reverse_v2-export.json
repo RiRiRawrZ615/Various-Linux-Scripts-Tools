@@ -6,7 +6,7 @@
     "name": "leanrea Reverse Engineer",
     "meta": {
       "i18n": null,
-      "description": "Reverse Engineer Anything. Routes a target by magic bytes, runs the real RE CLIs (rabin2, objdump, readelf, r2, tshark, wabt, unblob, jadx, apktool, Ghidra headless, pwn checksec), and keeps durable per-project state: a step log, a findings ledger with seen/inferred/unknown discipline, and context-budget accounting. resume() and handoff() rebuild working context from disk after a crash or context loss.",
+      "description": "Per-project reverse engineering harness. Routes a target by magic bytes first, runs the cheapest inventory next, then decompiles. Carries its own stdlib parser for formats with no CLI (dex, axml, apksig, asar, hermes, PE, Mach-O, WASM), a Ghidra post-script, and a per-package-manager install map. Durable per-project state: step log, findings ledger with seen/inferred/unknown discipline, re-greppable saved output, context-budget counter. resume() and handoff() rebuild working context from disk after a crash.",
       "manifest": {
         "title": "leanrea Reverse Engineer",
         "author": "alex",

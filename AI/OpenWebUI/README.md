@@ -3,7 +3,15 @@
 A specialized set of launcher scripts designed for Fedora-based distributions to run OpenWebUI with llama.cpp.
 
 > [!IMPORTANT]
-> **Hardcoded Hostname Warning:** These scripts currently have the hostname `amd` hardcoded into the paths. If your system uses a different hostname, you **must** edit the scripts to match your environment before running them.
+> **Hardcoded Hostname Warning:** The launcher scripts have the hostname `amd` hardcoded into the paths. If your system uses a different hostname, you **must** edit the scripts to match your environment before running them.
+
+## 📁 Subfolders
+
+* **[Strata](./Strata/)**: profile preparation, profile selection, MTP inspection, and the Strata-aware launcher. Own folder because these do not just start the app; they manage a second backend alongside llama.cpp. See its README for the env vars.
+* **[Tools](./Tools/)**: Open WebUI workspace tools kept as JSON exports, with import instructions and a per-tool description.
+* **[Updaters](./Updaters/)**: rebuild scripts for upstream llama.cpp, split by AMD/Vulkan and NVIDIA/CUDA.
+
+Note on the hostname: in `AMD/` and `Nvidia/` the `amd` string is a real path (`WEBUI_DATA_DIR`). In `Strata/strata_openwebui_launcher.sh` it only appears inside injected prompt text, so that launcher runs on any machine but writes the wrong workspace name into the prompt. The `temp` files in this folder are single-token stubs: the root one is empty, the AMD and Nvidia ones hold a literal `null`.
 
 ## 📁 Directory Structure
 

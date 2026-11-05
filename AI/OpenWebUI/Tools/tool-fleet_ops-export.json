@@ -6,7 +6,7 @@
     "name": "Fleet Ops",
     "meta": {
       "i18n": null,
-      "description": "Fleet control for your own machines. SSH command execution, persistent tmux-backed sessions (OpenTerminal style), wireless ADB, and a portable encrypted per-host credential vault with identity-based smart detection. Instructions live in the method docstrings.",
+      "description": "Fleet control for your own machines: SSH command execution, persistent tmux-backed sessions so long-running processes survive between tool calls, wireless ADB for Android targets, and a portable encrypted per-host credential vault. Identity is machine_id, not IP, so a DHCP address that changes hands gets retagged instead of resolving to the wrong entry.",
       "manifest": {
         "title": "Fleet Ops",
         "author": "RiRiRawrZ615",

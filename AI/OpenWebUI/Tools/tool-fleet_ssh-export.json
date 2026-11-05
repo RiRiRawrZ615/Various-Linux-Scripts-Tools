@@ -6,7 +6,7 @@
     "name": "Fleet SSH + RustDesk",
     "meta": {
       "i18n": null,
-      "description": "Runs shell commands, moves files, and inspects machines across your own fleet over SSH (shared key auth), plus RustDesk peer lookup and GUI session launch. SSH is the command channel; the installed RustDesk build is UI-only and cannot be scripted.",
+      "description": "Lighter sibling of Fleet Ops: run, run_sudo, push, pull, check, fleet, rustdesk. No sessions, no ADB, no vault. SSH is the command channel; the installed RustDesk build is the Flutter UI binary and cannot be scripted for headless control.",
       "manifest": {
         "title": "Fleet SSH + RustDesk",
         "author": "RiRiRawrZ615",

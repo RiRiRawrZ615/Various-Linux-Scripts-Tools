@@ -23,7 +23,8 @@ own user's permissions. Read a tool's source before importing it.
 | `tool-custom_leanrea_reverse_v2-export.json` | leanrea Reverse Engineer | Per-project reverse engineering harness: routes a target by magic bytes, runs the real RE CLIs, and keeps durable state on disk. |
 | `tool-fleet_ops-export.json` | Fleet Ops | Fleet control over SSH with tmux sessions, wireless ADB, and an encrypted per-host credential vault. |
 | `tool-fleet_ssh-export.json` | Fleet SSH + RustDesk | Smaller sibling of Fleet Ops: SSH commands, file push/pull, connectivity checks, RustDesk peer lookup. |
-| `tool-custom_duckduckgo_search_30-export-1793741845880.json` | Web Search | Public web search, single-URL extraction, and bounded multi-source research. |
+| `owui_web_search_40-import-fixed.json` | Web Search 4.0 (cache-first) | Pages downloaded once to disk as text files; later reads come from those files, not the web. Focus windows instead of page dumps, hard output budgets, `offline=True` for zero-network answers. |
+| `tool-custom_duckduckgo_search_30-export-1793741845880.json` | Web Search | Predecessor of 4.0: search, single-URL extraction, bounded research. No disk cache. |
 | `tool-custom_social_reddit_x_1-export.json` | Reddit + X Reader | Keyless Reddit and X readers: listings, threads with comment trees, profiles, and search. |
 | `tool-custom_youtube_visual_1-export-1793741840426.json` | YouTube Visual Reader | Captions plus an optional time-coded visual pass over storyboard frames. |
 | `tool-youtube_video_parser-export-1793741843741.json` | YouTube Video Parser | Captions or transcript for a YouTube URL, falling back to public metadata. |
@@ -82,7 +83,22 @@ RustDesk is reported, not driven. The installed build is the Flutter UI binary, 
 so there is no headless remote-control mode. `launch=True` opens the interactive window, which
 needs a display.
 
-### Web Search
+### Web Search 4.0 (cache-first)
+
+The cache-first version, and the one to import. Pages land on disk as plain text and are read
+from disk on later calls rather than re-fetched. `cache_index` lists what is already stored,
+`read_cache` pulls a slice from a stored page, `grep_cache` searches every cached page without
+touching the network, and `cache_prune` drops entries past an age limit. `offline=True` answers
+purely from the local cache with zero network. A `*` in `search` output marks a page already on
+disk, so read the file instead of fetching it again.
+
+Two behaviours worth knowing, both tracked as fork work: the cache is global across chats, so an
+unrelated query can surface unrelated pages, and an empty page file still counts as a cache hit,
+which returns nothing.
+
+Needs `requests`, `bs4`, `ddgs`. Falls back to `urllib` when `requests` is absent.
+
+### Web Search (predecessor)
 
 `search`, `fetch_url`, `research`. `research` is the multi-source one; it runs several queries and
 returns source-labeled evidence rather than snippets. It does not touch Knowledge Bases or RAG.
@@ -133,15 +149,15 @@ standard math functions. No `eval()`, so arbitrary code cannot run. `evaluate_ba
 
 ## Notes on the folder
 
-Two tools have duplicate exports: `tool-custom_social_reddit_x_1-export-1793741849847.json` is
-identical in content to `tool-custom_social_reddit_x_1-export.json`, and the two
-`tool-youtube_video_parser-export-*` files are identical too. They are kept as-is for history,
-so pick one and do not import both.
+Duplicates were removed on 2026-11-05. The folder used to hold two byte-identical YouTube Parser
+exports and two Reddit + X Reader exports whose `content` was identical but whose `specs` listed
+the methods in a different order. One copy of each is kept.
 
-The leanrea export and the two fleet exports are pretty-printed so they read cleanly in the GitHub
-viewer. The rest are single-line as Open WebUI writes them. Pretty-printing changes only the JSON
-layout, never the data, so an import behaves the same either way. The Python source still lives
-inside the `content` string as escaped newlines, which is what Open WebUI expects.
+Every export is pretty-printed now. Previously only the leanrea and fleet exports were, and the
+rest were single-line as Open WebUI writes them. Pretty-printing changes only the JSON layout,
+never the data, so an import behaves the same either way. The Python source still lives inside the
+`content` string as escaped newlines, which is what Open WebUI expects. Descriptions for every tool
+were rewritten from the source itself rather than from the filename.
 
 The fleet tools have been sanitized for public use: no personal host catalog, no machine IDs, no
 network addresses, no private paths, no default credentials. Other tools still carry an author in
